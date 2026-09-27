@@ -8,10 +8,12 @@ import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from threading import Lock
-from typing import Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator
 
-from fastapi import FastAPI, Request
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,12 +24,16 @@ from agent import (
     create_async_order_agent,
 )
 from outcome import AgentOutcome, OutcomeKind
+from session_locks import SessionLockRegistry
+from session_ownership import SessionOwnershipStore
 from tools.context import AgentContext
 
 
 logger = logging.getLogger("uvicorn.error")
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 25.0
 DISCONNECT_POLL_SECONDS = 0.1
+JWT_ALGORITHM = "HS256"
+bearer_scheme = HTTPBearer(auto_error=False)
 
 TOOL_PROGRESS_MESSAGES = {
     "get_order_facts": "正在查询订单事实",
@@ -51,6 +57,45 @@ def _positive_float(value: str | None, default: float) -> float:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+def _required_jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET")
+    if not secret:
+        raise RuntimeError("缺少环境变量: JWT_SECRET")
+    return secret
+
+
+def _unauthorized() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="无效或已过期的访问令牌",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def authenticated_user_id(
+    request: Request,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None,
+        Depends(bearer_scheme),
+    ],
+) -> str:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized()
+    try:
+        claims = jwt.decode(
+            credentials.credentials,
+            request.app.state.jwt_secret,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["sub", "exp"]},
+        )
+    except jwt.PyJWTError as error:
+        raise _unauthorized() from error
+    user_id = claims.get("sub")
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise _unauthorized()
+    return user_id
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -117,6 +162,7 @@ async def _run_agent(
     agent: Any,
     payload: ChatStreamRequest,
     queue: asyncio.Queue[dict[str, str]],
+    user_id: str,
 ) -> AgentOutcome:
     loop = asyncio.get_running_loop()
     callback = ToolProgressCallback(loop, queue)
@@ -128,9 +174,7 @@ async def _run_agent(
 
     async for update in agent.astream(
         {"messages": [HumanMessage(content=payload.message)]},
-        context=AgentContext(
-            user_id=os.getenv("AGENT_USER_ID", "demo-user")
-        ),
+        context=AgentContext(user_id=user_id),
         config=config,
         stream_mode="updates",
     ):
@@ -183,6 +227,7 @@ def create_app(
         selected_checkpoint = checkpoint_path or Path(
             os.getenv("CHECKPOINT_DB_PATH", str(DEFAULT_CHECKPOINT_PATH))
         )
+        app.state.jwt_secret = _required_jwt_secret()
         app.state.request_timeout_seconds = (
             request_timeout_seconds
             if request_timeout_seconds is not None
@@ -192,10 +237,19 @@ def create_app(
             )
         )
         app.state.execution_events = []
+        app.state.session_locks = SessionLockRegistry()
         app.state.agent = await create_async_order_agent(selected_checkpoint)
+        try:
+            app.state.session_ownership = await SessionOwnershipStore.open(
+                selected_checkpoint
+            )
+        except Exception:
+            await close_async_order_agent(app.state.agent)
+            raise
         try:
             yield
         finally:
+            await app.state.session_ownership.close()
             await close_async_order_agent(app.state.agent)
 
     app = FastAPI(title="Group Buy Agent API", lifespan=lifespan)
@@ -204,24 +258,46 @@ def create_app(
     async def chat_stream(
         payload: ChatStreamRequest,
         request: Request,
+        user_id: Annotated[str, Depends(authenticated_user_id)],
     ) -> StreamingResponse:
-        async def event_stream() -> AsyncIterator[bytes]:
-            queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
-            execution = asyncio.create_task(
-                _run_agent(app.state.agent, payload, queue)
+        if not await app.state.session_ownership.claim(
+            payload.session_id,
+            user_id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="该 session_id 已属于其他用户",
             )
-            started_at = asyncio.get_running_loop().time()
-            disconnected_recorded = False
-
-            yield _sse(
-                "progress",
-                {
-                    "stage": "understanding",
-                    "message": "正在理解问题",
+        session_lock = await app.state.session_locks.try_acquire(
+            payload.session_id
+        )
+        if session_lock is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "SESSION_BUSY",
+                    "message": "该会话正在处理另一个请求，请稍后重试。",
                 },
             )
 
+        async def event_stream() -> AsyncIterator[bytes]:
+            queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+            execution: asyncio.Task[AgentOutcome] | None = None
+            started_at = asyncio.get_running_loop().time()
+            disconnected_recorded = False
+
             try:
+                execution = asyncio.create_task(
+                    _run_agent(app.state.agent, payload, queue, user_id)
+                )
+                yield _sse(
+                    "progress",
+                    {
+                        "stage": "understanding",
+                        "message": "正在理解问题",
+                    },
+                )
+
                 while True:
                     if await request.is_disconnected():
                         _record_execution(
@@ -281,14 +357,16 @@ def create_app(
                         payload.session_id,
                         "client_disconnected",
                     )
-                await _cancel_task(app, payload.session_id, execution)
+                if execution is not None:
+                    await _cancel_task(app, payload.session_id, execution)
                 raise
             except Exception:
                 logger.exception(
                     "agent_stream_failed session_id=%s",
                     payload.session_id,
                 )
-                await _cancel_task(app, payload.session_id, execution)
+                if execution is not None:
+                    await _cancel_task(app, payload.session_id, execution)
                 yield _sse(
                     "final",
                     {
@@ -297,8 +375,12 @@ def create_app(
                     },
                 )
             finally:
-                if not execution.done():
+                if execution is not None and not execution.done():
                     await _cancel_task(app, payload.session_id, execution)
+                app.state.session_locks.release(
+                    payload.session_id,
+                    session_lock,
+                )
 
         return StreamingResponse(
             event_stream(),

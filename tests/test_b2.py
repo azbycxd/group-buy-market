@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +55,7 @@ def collect_sse(
     url: str,
     payload: dict[str, str],
     *,
+    token: str,
     timeout: float = 40,
 ) -> tuple[list[dict[str, Any]], float]:
     events: list[dict[str, Any]] = []
@@ -60,7 +63,12 @@ def collect_sse(
     current_data: str | None = None
     started_at = time.monotonic()
     with httpx.Client(timeout=timeout, trust_env=False) as client:
-        with client.stream("POST", url, json=payload) as response:
+        with client.stream(
+            "POST",
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if line.startswith("event: "):
@@ -98,6 +106,12 @@ class B2IntegrationTests(unittest.TestCase):
         cls.api_process: subprocess.Popen[bytes] | None = None
         cls.api_log_path = cls.temp_path / "api.log"
         cls.api_log = cls.api_log_path.open("w+b")
+        cls.jwt_secret = secrets.token_urlsafe(32)
+        cls.token = jwt.encode(
+            {"sub": "demo-user", "exp": int(time.time()) + 3600},
+            cls.jwt_secret,
+            algorithm="HS256",
+        )
         cls._start_fake_java(delay_seconds=0)
 
         launcher = (
@@ -105,6 +119,7 @@ class B2IntegrationTests(unittest.TestCase):
             f"os.environ['FAKE_JAVA_BASE_URL']='http://127.0.0.1:{cls.fake_port}'; "
             f"os.environ['CHECKPOINT_DB_PATH']={str(cls.temp_path / 'checkpoints.sqlite')!r}; "
             "os.environ['AGENT_REQUEST_TIMEOUT_SECONDS']='25'; "
+            f"os.environ['JWT_SECRET']={cls.jwt_secret!r}; "
             f"uvicorn.run(api.app,host='127.0.0.1',port={cls.api_port},"
             "log_level='info')"
         )
@@ -162,6 +177,7 @@ class B2IntegrationTests(unittest.TestCase):
                 "session_id": f"sse-{uuid.uuid4().hex}",
                 "message": "活动 100123 还有效吗",
             },
+            token=self.token,
         )
         self.assertEqual(events[0]["event"], "progress")
         self.assertEqual(events[0]["data"]["stage"], "understanding")
@@ -183,12 +199,14 @@ class B2IntegrationTests(unittest.TestCase):
         first, _ = collect_sse(
             self.url,
             {"session_id": session_id, "message": "这个活动还有效吗"},
+            token=self.token,
         )
         self.assertEqual(first[-1]["data"]["kind"], "REQUEST_INPUT")
 
         second, _ = collect_sse(
             self.url,
             {"session_id": session_id, "message": "100123"},
+            token=self.token,
         )
         self.assertEqual(second[-1]["data"]["kind"], "ANSWER")
         self.assertTrue(
@@ -208,6 +226,7 @@ class B2IntegrationTests(unittest.TestCase):
                     "session_id": session_id,
                     "message": "为什么我不能参加活动 100123",
                 },
+                headers={"Authorization": f"Bearer {self.token}"},
             ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
@@ -238,6 +257,7 @@ class B2IntegrationTests(unittest.TestCase):
                 "session_id": f"timeout-{uuid.uuid4().hex}",
                 "message": "活动 100123 还有效吗",
             },
+            token=self.token,
             timeout=35,
         )
         self.assertEqual(events[-1]["event"], "timeout")
