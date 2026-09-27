@@ -40,11 +40,6 @@ def search_group_buy_rules(query: str) -> dict[str, object]:
         for rule in RULES
         if any(keyword in normalized for keyword in rule["keywords"])
     ]
-    if not matches:
-        matches = [
-            {key: value for key, value in rule.items() if key != "keywords"}
-            for rule in RULES[:3]
-        ]
 
     facts = RuleSearchFacts.model_validate(
         {"query": query, "matches": matches}
