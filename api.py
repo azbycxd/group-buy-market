@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, AsyncIterator
@@ -17,12 +18,24 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from action_ledger import (
+    AgentActionStore,
+    action_args_hash_is_current,
+    credential_matches,
+    required_confirmation_secret,
+)
 from agent import (
     DEFAULT_CHECKPOINT_PATH,
     close_async_order_agent,
     create_async_order_agent,
+)
+from confirmation_workflow import (
+    close_async_confirmation_workflow,
+    confirmation_config,
+    create_async_confirmation_workflow,
 )
 from outcome import AgentOutcome, OutcomeKind
 from session_locks import SessionLockRegistry
@@ -52,6 +65,12 @@ class ChatStreamRequest(BaseModel):
     message: str = Field(min_length=1)
 
 
+class ActionConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    credential: str = Field(min_length=64, max_length=64)
+
+
 def _positive_float(value: str | None, default: float) -> float:
     try:
         parsed = float(value) if value is not None else default
@@ -73,6 +92,81 @@ def _unauthorized() -> HTTPException:
         detail="无效或已过期的访问令牌",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def _confirmation_error(
+    status_code: int,
+    code: str,
+    message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validated_confirmation_action(
+    store: AgentActionStore,
+    *,
+    action_id: str,
+    user_id: str,
+    credential: str,
+) -> dict[str, Any]:
+    action = store.get_action(action_id)
+    if action is None:
+        raise _confirmation_error(
+            status.HTTP_404_NOT_FOUND,
+            "ACTION_NOT_FOUND",
+            "退款提议不存在",
+        )
+    if action.get("user_id") != user_id:
+        raise _confirmation_error(
+            status.HTTP_403_FORBIDDEN,
+            "ACTION_FORBIDDEN",
+            "无权确认该退款提议",
+        )
+    if action.get("status") != "PROPOSED":
+        raise _confirmation_error(
+            status.HTTP_409_CONFLICT,
+            "ACTION_NOT_PROPOSED",
+            "退款提议已不处于待确认状态",
+        )
+    expires_at = _parse_timestamp(action.get("expires_at"))
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        raise _confirmation_error(
+            status.HTTP_410_GONE,
+            "ACTION_EXPIRED",
+            "退款提议已过期，请重新发起",
+        )
+    if not action_args_hash_is_current(action):
+        raise _confirmation_error(
+            status.HTTP_409_CONFLICT,
+            "ACTION_ARGS_CHANGED",
+            "退款提议参数已变化，请重新发起",
+        )
+    if not credential_matches(
+        action,
+        credential,
+        secret=required_confirmation_secret(),
+    ):
+        raise _confirmation_error(
+            status.HTTP_403_FORBIDDEN,
+            "INVALID_CONFIRMATION_CREDENTIAL",
+            "确认凭证无效",
+        )
+    return action
 
 
 async def authenticated_user_id(
@@ -258,18 +352,28 @@ def create_app(
         )
         app.state.execution_events = []
         app.state.session_locks = SessionLockRegistry()
+        app.state.confirmation_locks = SessionLockRegistry()
+        app.state.action_store = AgentActionStore()
         app.state.agent = await create_async_order_agent(selected_checkpoint)
         try:
-            app.state.session_ownership = await SessionOwnershipStore.open(
-                selected_checkpoint
+            app.state.confirmation_graph = (
+                await create_async_confirmation_workflow(
+                    selected_checkpoint
+                )
             )
-        except Exception:
-            await close_async_order_agent(app.state.agent)
-            raise
-        try:
-            yield
+            try:
+                app.state.session_ownership = await SessionOwnershipStore.open(
+                    selected_checkpoint
+                )
+                try:
+                    yield
+                finally:
+                    await app.state.session_ownership.close()
+            finally:
+                await close_async_confirmation_workflow(
+                    app.state.confirmation_graph
+                )
         finally:
-            await app.state.session_ownership.close()
             await close_async_order_agent(app.state.agent)
 
     app = FastAPI(title="Group Buy Agent API", lifespan=lifespan)
@@ -464,6 +568,77 @@ def create_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.post("/v1/actions/{action_id}/confirm")
+    async def confirm_action(
+        action_id: str,
+        payload: ActionConfirmRequest,
+        user_id: Annotated[str, Depends(authenticated_user_id)],
+    ) -> dict[str, Any]:
+        action = _validated_confirmation_action(
+            app.state.action_store,
+            action_id=action_id,
+            user_id=user_id,
+            credential=payload.credential,
+        )
+        action_lock = await app.state.confirmation_locks.try_acquire(
+            action_id
+        )
+        if action_lock is None:
+            raise _confirmation_error(
+                status.HTTP_409_CONFLICT,
+                "ACTION_CONFIRM_BUSY",
+                "退款提议正在确认中",
+            )
+        try:
+            action = _validated_confirmation_action(
+                app.state.action_store,
+                action_id=action_id,
+                user_id=user_id,
+                credential=payload.credential,
+            )
+            try:
+                result = await app.state.confirmation_graph.ainvoke(
+                    Command(
+                        resume={"credential_validated": True}
+                    ),
+                    config=confirmation_config(action_id),
+                )
+            except Exception as error:
+                logger.warning(
+                    "confirmation_resume_failed action_id=%s error=%s",
+                    action_id,
+                    type(error).__name__,
+                )
+                raise _confirmation_error(
+                    status.HTTP_409_CONFLICT,
+                    "CONFIRMATION_WORKFLOW_UNAVAILABLE",
+                    "确认工作流不可恢复，请重新发起退款提议",
+                ) from error
+            if result.get("confirmed") is not True:
+                raise _confirmation_error(
+                    status.HTTP_409_CONFLICT,
+                    "ACTION_CONFIRM_CONFLICT",
+                    "退款提议状态或版本已变化",
+                )
+            confirmed = app.state.action_store.get_action(action_id)
+            if confirmed is None or confirmed.get("status") != "CONFIRMED":
+                raise _confirmation_error(
+                    status.HTTP_409_CONFLICT,
+                    "ACTION_CONFIRM_CONFLICT",
+                    "退款提议确认未完成",
+                )
+            return {
+                "action_id": action_id,
+                "status": "CONFIRMED",
+                "version": confirmed["version"],
+                "executed": False,
+            }
+        finally:
+            app.state.confirmation_locks.release(
+                action_id,
+                action_lock,
+            )
 
     return app
 

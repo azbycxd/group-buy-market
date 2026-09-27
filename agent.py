@@ -23,8 +23,13 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
-from action_ledger import AgentActionStore
+from action_ledger import (
+    AgentActionStore,
+    confirmation_credential,
+    required_confirmation_secret,
+)
 from agent_middleware import create_agent_middleware
+from confirmation_workflow import start_confirmation_workflow
 from evidence import (
     CLEAR_EVIDENCE,
     Evidence,
@@ -399,7 +404,10 @@ def _checkpoint_serde() -> JsonPlusSerializer:
     )
 
 
-def _compile_order_agent(checkpointer: object):
+def _compile_order_agent(
+    checkpointer: object,
+    checkpoint_path: Path,
+):
     model = _create_model()
     understander = create_understander(model)
     outcome_generator = model.with_structured_output(
@@ -583,7 +591,7 @@ def _compile_order_agent(checkpointer: object):
         preview = RefundPreviewFacts.model_validate(preview_result["data"])
         evidence = _refund_evidence(order_result, preview)
         common_texts = [
-            "C1 当前仅生成只读退款预览，没有执行任何退款。",
+            "当前仅生成只读退款预览，没有执行任何退款。",
             (
                 "退款资金是否到账不在当前系统事实范围内，"
                 "本系统不承诺退款到账。"
@@ -624,11 +632,13 @@ def _compile_order_agent(checkpointer: object):
             if not session_id:
                 outcome = _capability_outcome(
                     OutcomeKind.HANDOFF,
-                    "缺少会话标识，无法记录退款提议。C1 未执行任何退款。",
+                    "缺少会话标识，无法记录退款提议。当前未执行任何退款。",
                 )
             else:
                 try:
-                    action_id = AgentActionStore().create_refund_proposal(
+                    confirm_secret = required_confirmation_secret()
+                    action_store = AgentActionStore()
+                    action, created = action_store.create_or_reuse_refund_proposal(
                         session_id=session_id,
                         user_id=runtime.context.user_id,
                         out_trade_no=order_entity.value,
@@ -638,17 +648,38 @@ def _compile_order_agent(checkpointer: object):
                             f"{preview.team_update_time}"
                         ),
                     )
-                except sqlite3.Error:
+                    if created:
+                        start_confirmation_workflow(
+                            checkpoint_path,
+                            action,
+                        )
+                    credential = confirmation_credential(
+                        action,
+                        secret=confirm_secret,
+                    )
+                except (sqlite3.Error, OSError, RuntimeError, ValueError):
                     outcome = _capability_outcome(
                         OutcomeKind.HANDOFF,
-                        "退款提议台账暂时不可用。C1 未执行任何退款。",
+                        "退款提议或确认流程暂时不可用，未执行任何退款。",
                     )
                 else:
+                    action_id = str(action["action_id"])
+                    proposal_text = (
+                        "已复用尚未过期的退款提议"
+                        if not created
+                        else "已生成只读退款提议"
+                    )
                     outcome = _refund_outcome(
                         kind=OutcomeKind.ANSWER,
                         preview=preview,
                         capability_texts=[
-                            f"已生成只读退款提议，action_id：{action_id}。",
+                            f"{proposal_text}，action_id：{action_id}。",
+                            (
+                                "确认凭证："
+                                f"{credential}；有效期至 {action['expires_at']}。"
+                                "该凭证只能提交到确认 HTTP 接口，"
+                                "在普通聊天中说“我确认”不会生效。"
+                            ),
                             (
                                 "如果未来由用户确认，将为订单 "
                                 f"{order_entity.value} 按 {preview.refund_type} "
@@ -817,7 +848,7 @@ def create_order_agent(
         serde=_checkpoint_serde(),
     )
     try:
-        return _compile_order_agent(checkpointer)
+        return _compile_order_agent(checkpointer, checkpoint_file)
     except Exception:
         checkpoint_connection.close()
         raise
@@ -834,7 +865,7 @@ async def create_async_order_agent(
         serde=_checkpoint_serde(),
     )
     try:
-        return _compile_order_agent(checkpointer)
+        return _compile_order_agent(checkpointer, checkpoint_file)
     except Exception:
         await checkpoint_connection.close()
         raise

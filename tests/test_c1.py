@@ -43,7 +43,11 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
         )
         cls.temp_path = Path(cls.temporary_directory.name)
         cls.action_path = cls.temp_path / "agent_actions.sqlite"
+        cls.previous_confirm_secret = os.environ.get(
+            "ACTION_CONFIRM_SECRET"
+        )
         os.environ["AGENT_ACTION_DB_PATH"] = str(cls.action_path)
+        os.environ["ACTION_CONFIRM_SECRET"] = "c1-integration-confirm-secret"
         cls.fake_port = free_port()
         cls.fake_process = start_fake_java(cls.fake_port)
         os.environ["FAKE_JAVA_BASE_URL"] = (
@@ -61,6 +65,12 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
         close_order_agent(cls.agent)
         stop_process(cls.fake_process)
         os.environ.pop("AGENT_ACTION_DB_PATH", None)
+        if cls.previous_confirm_secret is None:
+            os.environ.pop("ACTION_CONFIRM_SECRET", None)
+        else:
+            os.environ["ACTION_CONFIRM_SECRET"] = (
+                cls.previous_confirm_secret
+            )
         cls.temporary_directory.cleanup()
 
     def invoke(self, text: str) -> dict[str, object]:
