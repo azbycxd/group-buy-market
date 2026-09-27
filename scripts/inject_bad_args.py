@@ -95,13 +95,13 @@ def scripted_agent(activity_id: Any, call_id: str) -> Any:
 def run_case(
     *,
     user_text: str,
-    mention: EntityMention,
+    mentions: list[EntityMention],
     activity_id: Any,
     call_id: str,
 ) -> tuple[list[ToolMessage], int]:
     global REQUEST_COUNT
     REQUEST_COUNT = 0
-    entities = resolve_entities(user_text, [mention])
+    entities = resolve_entities(user_text, mentions)
     result = scripted_agent(activity_id, call_id).invoke(
         {"messages": [{"role": "user", "content": user_text}]},
         context=AgentContext(
@@ -144,10 +144,12 @@ def main() -> None:
     try:
         bad_value_messages, bad_value_count = run_case(
             user_text="请查询 activityId=100123 的活动状态",
-            mention=EntityMention(
-                entity_type=EntityType.ACTIVITY,
-                source_text="activityId=100123",
-            ),
+            mentions=[
+                EntityMention(
+                    entity_type=EntityType.ACTIVITY,
+                    source_text="activityId=100123",
+                )
+            ],
             activity_id=200456,
             call_id="bad-value",
         )
@@ -159,10 +161,12 @@ def main() -> None:
 
         wrong_semantic_messages, wrong_semantic_count = run_case(
             user_text="请查询订单号 ORD100001",
-            mention=EntityMention(
-                entity_type=EntityType.ORDER,
-                source_text="ORD100001",
-            ),
+            mentions=[
+                EntityMention(
+                    entity_type=EntityType.ORDER,
+                    source_text="ORD100001",
+                )
+            ],
             activity_id="ORD100001",
             call_id="wrong-semantic",
         )
@@ -174,10 +178,12 @@ def main() -> None:
 
         normal_messages, normal_count = run_case(
             user_text="请查询 activityId=100123 的活动状态",
-            mention=EntityMention(
-                entity_type=EntityType.ACTIVITY,
-                source_text="activityId=100123",
-            ),
+            mentions=[
+                EntityMention(
+                    entity_type=EntityType.ACTIVITY,
+                    source_text="activityId=100123",
+                )
+            ],
             activity_id=100123,
             call_id="normal",
         )
@@ -185,6 +191,27 @@ def main() -> None:
             "NORMAL_ACTIVITY_ID:",
             result_code(normal_messages),
             f"fake_java_requests={normal_count}",
+        )
+
+        overlap_messages, overlap_count = run_case(
+            user_text="订单 ORD100123 的活动 100123 还有效吗",
+            mentions=[
+                EntityMention(
+                    entity_type=EntityType.ORDER,
+                    source_text="ORD100123",
+                ),
+                EntityMention(
+                    entity_type=EntityType.ACTIVITY,
+                    source_text="活动 100123",
+                ),
+            ],
+            activity_id=100123,
+            call_id="overlapping-number",
+        )
+        print(
+            "OVERLAPPING_NUMBER:",
+            result_code(overlap_messages),
+            f"fake_java_requests={overlap_count}",
         )
     finally:
         if original_base_url is None:

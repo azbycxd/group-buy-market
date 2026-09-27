@@ -117,13 +117,14 @@ def _comes_from_other_semantic(
     expected_type: EntityType,
     request: Any,
 ) -> bool:
-    candidate = str(value)
+    trusted = _trusted_values(request)
+    if value in trusted[expected_type]:
+        return False
+
     for entity in getattr(request.runtime.context, "parsed_entities", ()):
         if entity.entity_type is expected_type:
             continue
-        if candidate == str(entity.value) or candidate == entity.source_text:
-            return True
-        if candidate and candidate in entity.source_text:
+        if value == entity.value:
             return True
     return False
 
@@ -134,6 +135,10 @@ def _entity_error(
     expected_type: EntityType,
     request: Any,
 ) -> str | None:
+    trusted = _trusted_values(request)
+    if value in trusted[expected_type]:
+        return None
+
     if expected_type is EntityType.ACTIVITY:
         valid_type = isinstance(value, int) and not isinstance(value, bool) and value > 0
         other_label = "订单号"
@@ -146,7 +151,6 @@ def _entity_error(
     if not valid_type:
         return f"参数 {parameter} 类型不正确，且没有匹配的可信来源。"
 
-    trusted = _trusted_values(request)
     if value not in trusted[expected_type]:
         return f"参数 {parameter}={value!r} 无可信来源，禁止执行 Tool。"
     return None
