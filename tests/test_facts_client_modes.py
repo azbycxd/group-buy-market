@@ -65,7 +65,7 @@ class FactsClientModeTests(unittest.TestCase):
         self.assertNotIn("userId", call.kwargs["json"])
 
     @patch("tools.facts_client.FACTS_HTTP_CLIENT.post")
-    def test_real_mode_uses_internal_jwt_and_trusted_identity_headers(
+    def test_real_mode_puts_trusted_identity_only_in_internal_jwt(
         self,
         post: Mock,
     ) -> None:
@@ -88,9 +88,11 @@ class FactsClientModeTests(unittest.TestCase):
         self.assertTrue(result["success"])
         call = post.call_args
         headers = call.kwargs["headers"]
-        self.assertEqual(headers["X-Authenticated-User-Id"], "xfg05")
+        self.assertEqual(
+            set(headers),
+            {"Authorization", "X-Request-Id"},
+        )
         self.assertEqual(headers["X-Request-Id"], "request-real")
-        self.assertNotIn("X-Dev-Authenticated-User-Id", headers)
         self.assertNotIn("userId", call.kwargs["json"])
         token = headers["Authorization"].removeprefix("Bearer ")
         claims = jwt.decode(
@@ -100,6 +102,7 @@ class FactsClientModeTests(unittest.TestCase):
             issuer=environment["JAVA_INTERNAL_JWT_ISSUER"],
             audience=environment["JAVA_INTERNAL_JWT_AUDIENCE"],
         )
+        self.assertEqual(claims["sub"], "xfg05")
         self.assertLessEqual(claims["exp"] - int(time.time()), 60)
 
     @patch("tools.facts_client.FACTS_HTTP_CLIENT.post")

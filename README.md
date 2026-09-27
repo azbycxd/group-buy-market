@@ -107,9 +107,10 @@ $env:JAVA_INTERNAL_JWT_AUDIENCE = "group-buy-market"
 ```
 
 真实模式会为每次 Facts 请求生成 HS256 短时内部 JWT，并发送
-`Authorization: Bearer <internal JWT>`、`X-Authenticated-User-Id` 和
-`X-Request-Id`。用户身份仍只来自 HTTP 访问 JWT 已验证的 `sub`，不会进入 Tool
-参数 schema。内部 JWT、签名 secret 不写日志、不进入 Prompt、SSE 或 Tool 输出。
+`Authorization: Bearer <internal JWT>` 和 `X-Request-Id`。internal JWT 的 `sub`
+来自 HTTP 访问 JWT 已验证的用户身份；真实模式不再发送用户身份 Header。用户身份
+不会进入 Tool 参数 schema。internal JWT、签名 secret 和用户 ID 不写日志、不进入
+Prompt、SSE 或 Trace。
 
 真实模式启动顺序：
 

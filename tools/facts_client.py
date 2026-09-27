@@ -69,10 +69,11 @@ def _required_environment(name: str) -> str:
     return value
 
 
-def _internal_service_jwt() -> str:
+def _internal_service_jwt(user_id: str) -> str:
     now = int(time.time())
     return jwt.encode(
         {
+            "sub": user_id,
             "iss": _required_environment("JAVA_INTERNAL_JWT_ISSUER"),
             "aud": _required_environment("JAVA_INTERNAL_JWT_AUDIENCE"),
             "iat": now,
@@ -93,8 +94,7 @@ def _request_target(
         return (
             real_base_url,
             {
-                "Authorization": f"Bearer {_internal_service_jwt()}",
-                "X-Authenticated-User-Id": user_id,
+                "Authorization": f"Bearer {_internal_service_jwt(user_id)}",
                 "X-Request-Id": request_id,
             },
             "real",
