@@ -106,6 +106,7 @@ REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
         "refundProposalAllowed": False,
         "requiresManualReview": False,
         "orderUpdateTime": "2026-09-27T09:00:00+08:00",
+        "teamUpdateTime": "2026-09-27T09:03:00+08:00",
     },
     "ORD200001": {
         "orderStatus": "COMPLETE",
@@ -114,6 +115,7 @@ REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
         "refundProposalAllowed": True,
         "requiresManualReview": False,
         "orderUpdateTime": "2026-09-27T10:00:00+08:00",
+        "teamUpdateTime": "2026-09-27T10:05:00+08:00",
     },
     "ORD200002": {
         "orderStatus": "COMPLETE",
@@ -122,6 +124,7 @@ REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
         "refundProposalAllowed": True,
         "requiresManualReview": True,
         "orderUpdateTime": "2026-09-27T11:00:00+08:00",
+        "teamUpdateTime": "2026-09-27T11:07:00+08:00",
     },
 }
 

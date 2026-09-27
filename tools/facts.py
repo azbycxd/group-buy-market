@@ -109,6 +109,7 @@ class RefundPreviewFacts(FactsModel):
     refund_proposal_allowed: StrictBool = Field(alias="refundProposalAllowed")
     requires_manual_review: StrictBool = Field(alias="requiresManualReview")
     order_update_time: StrictStr = Field(alias="orderUpdateTime")
+    team_update_time: StrictStr = Field(alias="teamUpdateTime")
 
 
 class RuleMatch(FactsModel):

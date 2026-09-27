@@ -318,6 +318,11 @@ def _refund_evidence(
             type=EvidenceType.FACT,
             value=preview.order_update_time,
         ),
+        Evidence(
+            path="refund_preview.teamUpdateTime",
+            type=EvidenceType.FACT,
+            value=preview.team_update_time,
+        ),
     ]
 
 
@@ -628,7 +633,10 @@ def _compile_order_agent(checkpointer: object):
                         user_id=runtime.context.user_id,
                         out_trade_no=order_entity.value,
                         preview=preview.model_dump(mode="json", by_alias=True),
-                        expected_version=preview.order_update_time,
+                        expected_version=(
+                            f"{preview.order_update_time}|"
+                            f"{preview.team_update_time}"
+                        ),
                     )
                 except sqlite3.Error:
                     outcome = _capability_outcome(

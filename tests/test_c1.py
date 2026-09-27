@@ -109,11 +109,23 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
             self.assertEqual(action["out_trade_no"], "ORD200001")
             self.assertEqual(
                 action["expected_version"],
-                "2026-09-27T10:00:00+08:00",
+                (
+                    "2026-09-27T10:00:00+08:00|"
+                    "2026-09-27T10:05:00+08:00"
+                ),
             )
+            preview = json.loads(action["preview_json"])
             self.assertEqual(
-                json.loads(action["preview_json"])["refundType"],
-                "PAID_UNFORMED",
+                preview,
+                {
+                    "orderStatus": "COMPLETE",
+                    "teamStatus": "PROGRESS",
+                    "refundType": "PAID_UNFORMED",
+                    "refundProposalAllowed": True,
+                    "requiresManualReview": False,
+                    "orderUpdateTime": "2026-09-27T10:00:00+08:00",
+                    "teamUpdateTime": "2026-09-27T10:05:00+08:00",
+                },
             )
 
     def test_3_closed_order_does_not_create_proposal(self) -> None:
