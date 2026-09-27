@@ -33,8 +33,8 @@ class EvalResult:
 def load_cases() -> list[dict[str, Any]]:
     with CASES_PATH.open("r", encoding="utf-8") as file:
         cases = yaml.safe_load(file)
-    if not isinstance(cases, list) or len(cases) != 15:
-        raise ValueError("evals/cases.yaml 必须包含 15 条 Case")
+    if not isinstance(cases, list) or len(cases) != 16:
+        raise ValueError("evals/cases.yaml 必须包含 16 条 Case")
     for case in cases:
         required = {
             "id",
@@ -151,6 +151,12 @@ def evaluate_case(agent: Any, context_type: Any, case: dict[str, Any]) -> EvalRe
     if missing_tools:
         reasons.append(f"缺少 Tool: {', '.join(missing_tools)}")
 
+    forbidden_tools = [
+        name for name in case.get("forbidden_tools", []) if name in tool_calls
+    ]
+    if forbidden_tools:
+        reasons.append(f"调用禁用 Tool: {', '.join(forbidden_tools)}")
+
     normalized_answer = final_answer.lower()
     forbidden_hits = [
         term
@@ -194,7 +200,7 @@ def print_results(results: list[EvalResult]) -> None:
     for row in rows:
         print(" | ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
     passed = sum(result.passed for result in results)
-    print(f"PASS {passed}/15")
+    print(f"PASS {passed}/{len(results)}")
 
 
 def main() -> None:

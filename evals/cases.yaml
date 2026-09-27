@@ -119,3 +119,12 @@
   required_tools: [get_order_facts]
   forbidden_answer_terms: ["CLOSE", "NORMAL", "已关闭", "状态正常"]
   service_unavailable: true
+
+- id: refund_arrival_unsupported
+  category: 退款到账
+  input: "订单 ORD100001 CLOSE 了，退款到账了吗？"
+  need: REFUND_ARRIVAL
+  expected_action: HANDOFF
+  required_tools: []
+  forbidden_tools: [get_order_facts]
+  forbidden_answer_terms: ["退款已到账", "退款到账了", "退款未到账"]

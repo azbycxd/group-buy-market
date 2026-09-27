@@ -9,6 +9,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.runtime import Runtime
 
+from requirement_tracker import (
+    CAPABILITY_TABLE,
+    RequirementDecision,
+    RequirementStatus,
+    RequirementTracker,
+)
 from tools.activity_facts import get_activity_facts
 from tools.context import AgentContext
 from tools.eligibility_facts import get_user_eligibility_facts
@@ -16,6 +22,7 @@ from tools.joinable_team_facts import get_joinable_team_facts
 from tools.order_facts import get_order_facts
 from tools.rule_search import search_group_buy_rules
 from understanding import (
+    EntityType,
     InformationNeed,
     ParsedEntity,
     Understanding,
@@ -44,16 +51,6 @@ SYSTEM_PROMPT = (
 )
 
 
-TOOLS_BY_NEED = {
-    InformationNeed.ORDER_STATUS: (get_order_facts,),
-    InformationNeed.ACTIVITY_VALIDITY: (get_activity_facts,),
-    InformationNeed.USER_ELIGIBILITY: (get_user_eligibility_facts,),
-    InformationNeed.JOINABLE_TEAMS: (get_joinable_team_facts,),
-    InformationNeed.RULE_EXPLANATION: (search_group_buy_rules,),
-    InformationNeed.REFUND_ARRIVAL: (get_order_facts,),
-    InformationNeed.REFUND_REQUEST: (search_group_buy_rules,),
-}
-
 TOOL_ORDER = (
     get_order_facts,
     get_activity_facts,
@@ -67,6 +64,9 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
     understanding: Understanding
     parsed_entities: list[ParsedEntity]
+    requirement_status: RequirementStatus
+    missing_evidence: list[str]
+    agent_rounds: int
 
 
 def _create_model() -> ChatOpenAI:
@@ -86,11 +86,30 @@ def _latest_user_text(messages: list[AnyMessage]) -> str:
 
 def _select_tools(needs: list[InformationNeed]) -> list[object]:
     selected_names = {
-        tool.name
+        evidence_name
         for need in needs
-        for tool in TOOLS_BY_NEED.get(need, ())
+        for evidence_name in CAPABILITY_TABLE[need].required_evidence
     }
     return [tool for tool in TOOL_ORDER if tool.name in selected_names]
+
+
+def _called_tool_evidence(messages: list[AnyMessage]) -> list[str]:
+    """S5 temporary scaffold: infer evidence from tool calls; delete in S7."""
+    return [
+        call["name"]
+        for message in messages
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    ]
+
+
+def _request_input(decision: RequirementDecision) -> str:
+    requested: list[str] = []
+    if EntityType.ORDER in decision.missing_entities:
+        requested.append("订单号")
+    if EntityType.ACTIVITY in decision.missing_entities:
+        requested.append("活动 ID")
+    return f"请提供{'和'.join(requested)}，以便继续查询。"
 
 
 def _entity_context(entities: list[ParsedEntity]) -> str:
@@ -109,6 +128,7 @@ def _entity_context(entities: list[ParsedEntity]) -> str:
 def create_order_agent():
     model = _create_model()
     understander = create_understander(model)
+    tracker = RequirementTracker()
     agents: dict[tuple[str, ...], object] = {}
 
     def understand_node(state: AgentState) -> dict[str, object]:
@@ -122,26 +142,22 @@ def create_order_agent():
             "parsed_entities": parsed_entities,
         }
 
-    def route_after_understand(state: AgentState) -> str:
-        needs = state["understanding"].needs
-        if InformationNeed.OUT_OF_SCOPE in needs:
-            return "handoff"
-        return "agent"
-
-    def handoff_node(state: AgentState) -> dict[str, list[AIMessage]]:
-        return {
-            "messages": [
-                AIMessage(
-                    content="该请求超出当前只读拼团诊断能力范围，请联系人工客服处理。"
-                )
-            ]
-        }
-
     def agent_node(
         state: AgentState,
         runtime: Runtime[AgentContext],
-    ) -> dict[str, list[AnyMessage]]:
+    ) -> dict[str, object]:
         needs = state["understanding"].needs
+        decision = tracker.evaluate(
+            needs=needs,
+            entities=state.get("parsed_entities", []),
+            evidence=_called_tool_evidence(state["messages"]),
+        )
+        if decision.status in {
+            RequirementStatus.UNSUPPORTED,
+            RequirementStatus.NEED_USER_INPUT,
+        }:
+            return {"requirement_status": decision.status}
+
         tools = _select_tools(needs)
         cache_key = tuple(tool.name for tool in tools)
         inner_agent = agents.get(cache_key)
@@ -162,18 +178,68 @@ def create_order_agent():
             {"messages": inner_messages},
             context=runtime.context,
         )
-        return {"messages": result["messages"][len(inner_messages):]}
+        return {
+            "messages": result["messages"][len(inner_messages):],
+            "agent_rounds": state.get("agent_rounds", 0) + 1,
+        }
+
+    def finalize_node(state: AgentState) -> dict[str, object]:
+        decision = tracker.evaluate(
+            needs=state["understanding"].needs,
+            entities=state.get("parsed_entities", []),
+            evidence=_called_tool_evidence(state["messages"]),
+        )
+        update: dict[str, object] = {
+            "requirement_status": decision.status,
+            "missing_evidence": list(decision.missing_evidence),
+        }
+
+        if decision.status is RequirementStatus.UNSUPPORTED:
+            update["messages"] = [
+                AIMessage(
+                    content="该请求超出当前只读拼团诊断能力范围，请联系人工客服处理。"
+                )
+            ]
+        elif decision.status is RequirementStatus.NEED_USER_INPUT:
+            update["messages"] = [AIMessage(content=_request_input(decision))]
+        elif decision.status is RequirementStatus.NEED_MORE_EVIDENCE:
+            if state.get("agent_rounds", 0) >= 2:
+                update["messages"] = [
+                    AIMessage(
+                        content="缺少完成查询所需的业务信息，请联系人工客服处理。"
+                    )
+                ]
+            else:
+                missing = "、".join(decision.missing_evidence)
+                update["messages"] = [
+                    SystemMessage(
+                        content=(
+                            "RequirementTracker 判定仍缺少以下临时 Evidence："
+                            f"{missing}。请调用对应 Tool 后再回答。"
+                        )
+                    )
+                ]
+        return update
+
+    def route_after_finalize(state: AgentState) -> str:
+        if (
+            state["requirement_status"]
+            is RequirementStatus.NEED_MORE_EVIDENCE
+            and state.get("agent_rounds", 0) < 2
+        ):
+            return "agent"
+        return "end"
 
     graph = StateGraph(AgentState, context_schema=AgentContext)
     graph.add_node("understand", understand_node)
-    graph.add_node("handoff", handoff_node)
     graph.add_node("agent", agent_node)
+    graph.add_node("finalize", finalize_node)
     graph.add_edge(START, "understand")
+    graph.add_edge("understand", "agent")
+    graph.add_edge("agent", "finalize")
     graph.add_conditional_edges(
-        "understand",
-        route_after_understand,
-        {"handoff": "handoff", "agent": "agent"},
+        "finalize",
+        route_after_finalize,
+        {"agent": "agent", "end": END},
     )
-    graph.add_edge("handoff", END)
-    graph.add_edge("agent", END)
     return graph.compile()
