@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS agent_action (
     args_hash TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     version INTEGER NOT NULL,
+    result_code TEXT,
+    refund_executed INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
@@ -73,6 +75,10 @@ AGENT_ACTION_MIGRATIONS = {
     "version": (
         "ALTER TABLE agent_action "
         "ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+    ),
+    "result_code": "ALTER TABLE agent_action ADD COLUMN result_code TEXT",
+    "refund_executed": (
+        "ALTER TABLE agent_action ADD COLUMN refund_executed INTEGER"
     ),
 }
 
@@ -329,6 +335,8 @@ class AgentActionStore:
         from_status: ActionStatus,
         to_status: ActionStatus,
         expected_version: int,
+        result_code: str | None = None,
+        refund_executed: bool | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         if (from_status, to_status) not in ALLOWED_TRANSITIONS:
@@ -344,6 +352,8 @@ class AgentActionStore:
                     """
                     UPDATE agent_action
                     SET status = ?,
+                        result_code = ?,
+                        refund_executed = ?,
                         version = version + 1,
                         updated_at = ?
                     WHERE action_id = ?
@@ -352,6 +362,12 @@ class AgentActionStore:
                     """,
                     (
                         to_status.value,
+                        result_code,
+                        (
+                            None
+                            if refund_executed is None
+                            else int(refund_executed)
+                        ),
                         now_text,
                         action_id,
                         from_status.value,

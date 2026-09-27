@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import LLMResult
 
 from evidence import EvidenceType
@@ -36,6 +36,8 @@ class EvalRun:
     actual_action: str
     tools: list[str]
     evidence_paths: list[str]
+    understanding: list[str]
+    rule_matches: list[dict[str, Any]]
     token_count: int
     latency_seconds: float
     reasons: list[str]
@@ -112,6 +114,18 @@ def load_cases() -> list[dict[str, Any]]:
         ):
             raise ValueError(f"Case {case['id']} turns 至少包含两轮")
     return cases
+
+
+def select_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    configured = os.getenv("EVAL_CASE_IDS", "").strip()
+    if not configured:
+        return cases
+    requested = [item.strip() for item in configured.split(",") if item.strip()]
+    by_id = {str(case["id"]): case for case in cases}
+    unknown = [case_id for case_id in requested if case_id not in by_id]
+    if unknown:
+        raise ValueError(f"EVAL_CASE_IDS 包含未知 Case: {', '.join(unknown)}")
+    return [by_id[case_id] for case_id in requested]
 
 
 def free_port() -> int:
@@ -222,6 +236,30 @@ def evaluate_result(
     evidence = result.get("evidence", [])
     evidence_paths = [item.path for item in evidence]
     evidence_types = {item.path: item.type for item in evidence}
+    understanding = result.get("understanding")
+    understanding_needs = [
+        getattr(need, "value", str(need))
+        for need in getattr(understanding, "needs", [])
+    ]
+    rule_matches: list[dict[str, Any]] = []
+    for message in result.get("messages", []):
+        if not isinstance(message, ToolMessage) or message.name != (
+            "search_group_buy_rules"
+        ):
+            continue
+        content = message.content
+        try:
+            payload = json.loads(content) if isinstance(content, str) else content
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        data = payload.get("data")
+        matches = data.get("matches") if isinstance(data, dict) else None
+        if isinstance(matches, list):
+            rule_matches.extend(
+                item for item in matches if isinstance(item, dict)
+            )
 
     reasons: list[str] = []
     raw_outcome = result.get("outcome")
@@ -339,6 +377,8 @@ def evaluate_result(
         actual_action=actual_action,
         tools=tool_calls,
         evidence_paths=evidence_paths,
+        understanding=understanding_needs,
+        rule_matches=rule_matches,
         token_count=token_count,
         latency_seconds=latency_seconds,
         reasons=reasons,
@@ -445,7 +485,8 @@ def print_metrics(results: list[CaseRuns]) -> None:
 
 
 def main() -> None:
-    cases = load_cases()
+    cases = select_cases(load_cases())
+    diagnostic_mode = bool(os.getenv("EVAL_CASE_IDS", "").strip())
     port = free_port()
     fake_java = start_fake_java(port)
     original_base_url = os.environ.get("FAKE_JAVA_BASE_URL")
@@ -491,6 +532,8 @@ def main() -> None:
                             actual_action="ERROR",
                             tools=[],
                             evidence_paths=[],
+                            understanding=[],
+                            rule_matches=[],
                             token_count=0,
                             latency_seconds=time.perf_counter() - started_at,
                             reasons=[f"运行异常: {type(error).__name__}"],
@@ -499,6 +542,26 @@ def main() -> None:
             results.append(CaseRuns(case=case, runs=runs))
             passed = sum(run.passed for run in runs)
             print(f"[{len(results):02d}/{len(cases)}] {case['id']}: {passed}/{RUNS_PER_CASE}", flush=True)
+            if diagnostic_mode:
+                for run_number, run in enumerate(runs, start=1):
+                    print(
+                        "DIAGNOSTIC "
+                        + json.dumps(
+                            {
+                                "case_id": case["id"],
+                                "run": run_number,
+                                "understanding": run.understanding,
+                                "search_called": (
+                                    "search_group_buy_rules" in run.tools
+                                ),
+                                "matches": run.rule_matches,
+                                "outcome": run.actual_action,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
 
         print()
         print_case_results(results)

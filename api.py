@@ -737,6 +737,22 @@ def create_app(
                     action_id,
                     type(error).__name__,
                 )
+                current = app.state.action_store.get_action(action_id)
+                if current is not None and current.get("status") in {
+                    ActionStatus.EXECUTING.value,
+                    ActionStatus.UNKNOWN.value,
+                }:
+                    return _action_status_response(
+                        current,
+                        message=(
+                            "退款结果暂时无法确认，正在等待对账。"
+                        ),
+                    )
+                if current is not None and current.get("status") in {
+                    ActionStatus.SUCCEEDED.value,
+                    ActionStatus.FAILED.value,
+                }:
+                    return _action_status_response(current)
                 raise _confirmation_error(
                     status.HTTP_409_CONFLICT,
                     "CONFIRMATION_WORKFLOW_UNAVAILABLE",

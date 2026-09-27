@@ -77,12 +77,17 @@ def _transition(
     store: AgentActionStore,
     action: dict[str, Any],
     to_status: ActionStatus,
+    *,
+    result_code: str | None = None,
+    refund_executed: bool | None = None,
 ) -> dict[str, Any] | None:
     return store.transition_status(
         action_id=str(action["action_id"]),
         from_status=ActionStatus(str(action["status"])),
         to_status=to_status,
         expected_version=int(action["version"]),
+        result_code=result_code,
+        refund_executed=refund_executed,
     )
 
 
@@ -90,9 +95,16 @@ def _finish(
     store: AgentActionStore,
     action: dict[str, Any],
     status: ActionStatus,
-    message: str,
+    result_code: str,
+    refund_executed: bool,
 ) -> dict[str, object]:
-    transitioned = _transition(store, action, status)
+    transitioned = _transition(
+        store,
+        action,
+        status,
+        result_code=result_code,
+        refund_executed=refund_executed,
+    )
     latest = transitioned or store.get_action(str(action["action_id"]))
     final_status = (
         str(latest["status"])
@@ -101,9 +113,56 @@ def _finish(
     )
     return {
         "final_status": final_status,
-        "message": message if transitioned is not None else _status_message(final_status),
         "action_version": int(latest["version"]) if latest else 0,
     }
+
+
+def _result_message(
+    *,
+    status: ActionStatus,
+    result_code: str,
+    facts_determined: bool,
+    order_status: str | None,
+) -> str:
+    if status is ActionStatus.SUCCEEDED:
+        if facts_determined and order_status == "CLOSE":
+            return _status_message(ActionStatus.SUCCEEDED.value)
+        if facts_determined:
+            return (
+                f"Java 已确认退款操作成功（{result_code}），"
+                f"当前订单状态为 {order_status}，请稍后再次查询。"
+                "退款执行成功不代表支付渠道资金已经到账。"
+            )
+        return (
+            f"Java 已确认退款操作成功（{result_code}），"
+            "但暂时无法查询最新订单状态。"
+            "退款执行成功不代表支付渠道资金已经到账。"
+        )
+    if status is ActionStatus.FAILED:
+        if facts_determined and order_status == "CLOSE":
+            return (
+                "订单已经是关闭状态，本次没有重复退款。"
+                "订单关闭不代表支付渠道资金已经到账。"
+            )
+        if facts_determined:
+            return (
+                f"本次退款未执行（{result_code}），"
+                f"订单当前状态为 {order_status}，需要重新发起退款提议。"
+            )
+        return (
+            f"本次退款未执行（{result_code}），"
+            "且暂时无法查询当前订单状态；请稍后核实后重新发起退款提议。"
+        )
+    if facts_determined and order_status == "CLOSE":
+        return (
+            "退款结果暂时无法确认；订单当前已经是关闭状态，"
+            "仍需按原幂等键结果完成对账。"
+            "订单关闭不代表支付渠道资金已经到账。"
+        )
+    return (
+        "退款结果暂时无法确认；已使用原幂等键完成一次对账重试，"
+        "当前保持 UNKNOWN，请稍后查询。"
+    )
 
 
 def _compile_confirmation_graph(checkpointer: object):
@@ -170,11 +229,24 @@ def _compile_confirmation_graph(checkpointer: object):
             executing,
             request_id=state.get("request_id", ""),
         )
-        current = executing
-        if result.certainty is ExecutionCertainty.UNKNOWN:
-            unknown = _transition(store, executing, ActionStatus.UNKNOWN)
-            if unknown is not None:
-                current = unknown
+        target_status = {
+            ExecutionCertainty.SUCCESS: ActionStatus.SUCCEEDED,
+            ExecutionCertainty.FAILURE: ActionStatus.FAILED,
+            ExecutionCertainty.UNKNOWN: ActionStatus.UNKNOWN,
+        }[result.certainty]
+        current = _transition(
+            store,
+            executing,
+            target_status,
+            result_code=result.result_code,
+            refund_executed=(
+                result.refund_executed
+                if result.certainty is not ExecutionCertainty.UNKNOWN
+                else None
+            ),
+        )
+        if current is None:
+            current = store.get_action(state["action_id"]) or executing
         return {
             "execution_acquired": True,
             "execution_certainty": result.certainty.value,
@@ -200,94 +272,75 @@ def _compile_confirmation_graph(checkpointer: object):
             }
 
         request_id = state.get("request_id", "")
-        determined, order_status = _order_status(
-            action,
-            request_id=request_id,
-        )
-        if determined and order_status == "CLOSE":
-            return _finish(
-                store,
-                action,
-                ActionStatus.SUCCEEDED,
-                _status_message(ActionStatus.SUCCEEDED.value),
-            )
-
         certainty = ExecutionCertainty(
             state.get("execution_certainty", ExecutionCertainty.UNKNOWN.value)
         )
         result_code = state.get("result_code", "UNKNOWN_RESULT")
-        if determined and certainty is ExecutionCertainty.FAILURE:
-            message = (
-                "订单或团队状态已经变化，旧退款提议未执行，"
-                "请重新发起退款提议。"
-                if result_code == "VERSION_CHANGED"
-                else f"退款操作未完成：{result_code}。请重新发起退款提议。"
-            )
-            return _finish(
-                store,
+        if certainty in {
+            ExecutionCertainty.SUCCESS,
+            ExecutionCertainty.FAILURE,
+        }:
+            determined, order_status = _order_status(
                 action,
-                ActionStatus.FAILED,
-                message,
+                request_id=request_id,
             )
-
-        if action.get("status") == ActionStatus.EXECUTING.value:
-            unknown = _transition(store, action, ActionStatus.UNKNOWN)
-            if unknown is not None:
-                action = unknown
-        if action.get("status") != ActionStatus.UNKNOWN.value:
-            latest_status = str(action["status"])
+            final_status = (
+                ActionStatus.SUCCEEDED
+                if certainty is ExecutionCertainty.SUCCESS
+                else ActionStatus.FAILED
+            )
             return {
-                "final_status": latest_status,
-                "message": _status_message(latest_status),
+                "final_status": final_status.value,
+                "message": _result_message(
+                    status=final_status,
+                    result_code=result_code,
+                    facts_determined=determined,
+                    order_status=order_status,
+                ),
+                "action_version": int(action["version"]),
+                "retry_count": 0,
             }
 
         retry_result: RefundExecutionResult = execute_refund(
             action,
             request_id=request_id,
         )
-        retry_determined, retry_order_status = _order_status(
-            action,
-            request_id=request_id,
-        )
-        if retry_determined and retry_order_status == "CLOSE":
+        if retry_result.certainty is ExecutionCertainty.SUCCESS:
             result = _finish(
                 store,
                 action,
                 ActionStatus.SUCCEEDED,
-                _status_message(ActionStatus.SUCCEEDED.value),
+                retry_result.result_code,
+                retry_result.refund_executed,
             )
-            result["retry_count"] = 1
-            return result
-        if (
-            retry_determined
-            and retry_result.certainty is ExecutionCertainty.FAILURE
-        ):
-            message = (
-                "订单或团队状态已经变化，旧退款提议未执行，"
-                "请重新发起退款提议。"
-                if retry_result.result_code == "VERSION_CHANGED"
-                else (
-                    f"退款操作未完成：{retry_result.result_code}。"
-                    "请重新发起退款提议。"
-                )
-            )
+        elif retry_result.certainty is ExecutionCertainty.FAILURE:
             result = _finish(
                 store,
                 action,
                 ActionStatus.FAILED,
-                message,
+                retry_result.result_code,
+                retry_result.refund_executed,
             )
-            result["retry_count"] = 1
-            return result
-        return {
-            "final_status": ActionStatus.UNKNOWN.value,
-            "message": (
-                "退款结果暂时无法确定；已使用原幂等键完成一次对账重试，"
-                "当前保持 UNKNOWN，请稍后查询。"
-            ),
-            "retry_count": 1,
-            "action_version": int(action["version"]),
-        }
+        else:
+            result = {
+                "final_status": ActionStatus.UNKNOWN.value,
+                "action_version": int(action["version"]),
+            }
+
+        latest = store.get_action(state["action_id"]) or action
+        determined, order_status = _order_status(
+            latest,
+            request_id=request_id,
+        )
+        final_status = ActionStatus(str(result["final_status"]))
+        result["message"] = _result_message(
+            status=final_status,
+            result_code=retry_result.result_code,
+            facts_determined=determined,
+            order_status=order_status,
+        )
+        result["retry_count"] = 1
+        return result
 
     graph = StateGraph(ConfirmationState)
     graph.add_node("confirm", confirm_node)

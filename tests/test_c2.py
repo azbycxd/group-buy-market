@@ -42,6 +42,18 @@ PREVIEW = {
 EXPECTED_VERSION = (
     "2026-09-27T10:00:00+08:00|2026-09-27T10:05:00+08:00"
 )
+CLOSED_PREVIEW = {
+    "orderStatus": "CLOSE",
+    "teamStatus": "PROGRESS",
+    "refundType": "PAID_UNFORMED",
+    "refundProposalAllowed": False,
+    "requiresManualReview": False,
+    "orderUpdateTime": "2026-09-27T09:00:00+08:00",
+    "teamUpdateTime": "2026-09-27T09:03:00+08:00",
+}
+CLOSED_EXPECTED_VERSION = (
+    "2026-09-27T09:00:00+08:00|2026-09-27T09:03:00+08:00"
+)
 
 
 @unittest.skipUnless(
@@ -144,12 +156,23 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         out_trade_no: str | None = None,
         now: datetime | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        selected_out_trade_no = out_trade_no or "ORD100001"
+        selected_preview = (
+            CLOSED_PREVIEW
+            if selected_out_trade_no == "ORD100001"
+            else PREVIEW
+        )
+        selected_version = (
+            CLOSED_EXPECTED_VERSION
+            if selected_out_trade_no == "ORD100001"
+            else EXPECTED_VERSION
+        )
         action, created = self.store.create_or_reuse_refund_proposal(
             session_id=session_id or f"c2-{uuid.uuid4().hex}",
             user_id=user_id,
-            out_trade_no=out_trade_no or "ORD100001",
-            preview=PREVIEW,
-            expected_version=EXPECTED_VERSION,
+            out_trade_no=selected_out_trade_no,
+            preview=selected_preview,
+            expected_version=selected_version,
             now=now,
         )
         if created:

@@ -318,6 +318,7 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "SUCCEEDED")
         self.assertEqual(final["status"], "SUCCEEDED")
+        self.assertEqual(final["refund_executed"], 1)
 
     def test_2_paid_unformed_executes_and_reconciles(self) -> None:
         event, action, _ = self._proposal(
@@ -328,6 +329,7 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "SUCCEEDED")
         self.assertEqual(final["status"], "SUCCEEDED")
+        self.assertEqual(final["refund_executed"], 1)
 
     def test_3_paid_formed_remains_non_executable(self) -> None:
         before = len(self.store.list_actions())
@@ -380,7 +382,7 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
             proxy.close()
             self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
 
-    def test_5_java_failure_but_close_reconciles_to_success(self) -> None:
+    def test_5_java_failure_but_close_stays_failed(self) -> None:
         event, action, _ = self._proposal("agent_c3_unpaid", "930000000001")
         from tools.facts_client import _request_target
 
@@ -405,8 +407,14 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
 
         response = self._confirm(event, "agent_c3_unpaid")
         final = self.store.get_action(str(action["action_id"]))
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(final["status"], "SUCCEEDED")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(final["status"], "FAILED")
+        self.assertEqual(final["result_code"], "VERSION_CHANGED")
+        self.assertEqual(final["refund_executed"], 0)
+        self.assertIn(
+            "订单已经是关闭状态，本次没有重复退款",
+            response.json()["message"],
+        )
 
     def test_6_timeout_retries_once_with_same_key(self) -> None:
         proxy = _RefundRecordingProxy(
@@ -432,6 +440,31 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
         finally:
             proxy.close()
             self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
+
+    def test_7_two_sessions_same_order_have_one_success(self) -> None:
+        first_event, first_action, _ = self._proposal(
+            "agent_c3_unpaid", "930000000001"
+        )
+        second_event, second_action, _ = self._proposal(
+            "agent_c3_unpaid", "930000000001"
+        )
+
+        first_response = self._confirm(first_event, "agent_c3_unpaid")
+        second_response = self._confirm(second_event, "agent_c3_unpaid")
+        first_final = self.store.get_action(str(first_action["action_id"]))
+        second_final = self.store.get_action(str(second_action["action_id"]))
+
+        self.assertEqual(first_response.status_code, 200, first_response.text)
+        self.assertEqual(second_response.status_code, 409, second_response.text)
+        self.assertEqual(first_final["status"], "SUCCEEDED")
+        self.assertEqual(first_final["refund_executed"], 1)
+        self.assertEqual(second_final["status"], "FAILED")
+        self.assertEqual(second_final["refund_executed"], 0)
+        self.assertIn(
+            "订单已经是关闭状态，本次没有重复退款",
+            second_response.json()["message"],
+        )
+        self.assertNotIn("退款失败", second_response.json()["message"])
 
 
 if __name__ == "__main__":
