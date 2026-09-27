@@ -18,17 +18,21 @@ def _format_tool_call(name: str, args: dict[str, Any]) -> str:
     return f"调用 {name}({rendered_args})"
 
 
-def _tool_status(content: Any) -> str:
-    if isinstance(content, dict):
-        return str(content.get("status", content))
+def _tool_result(content: Any) -> str:
+    parsed = content
     if isinstance(content, str):
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
             return content
-        if isinstance(parsed, dict):
-            return str(parsed.get("status", parsed))
-    return str(content)
+
+    if isinstance(parsed, dict):
+        if parsed.get("code") != "0000":
+            return f"code={parsed.get('code')}, info={parsed.get('info')}"
+        data = parsed.get("data")
+        if isinstance(data, dict) and "status" in data:
+            return f"status={data['status']}"
+    return str(parsed)
 
 
 def main() -> None:
@@ -50,7 +54,7 @@ def main() -> None:
             if not message.tool_calls and message.content:
                 final_answer = message.content
         elif isinstance(message, ToolMessage):
-            print(f"返回 status={_tool_status(message.content)}")
+            print(f"返回 {_tool_result(message.content)}")
 
     if isinstance(final_answer, str):
         print(f"最终回答: {final_answer}")

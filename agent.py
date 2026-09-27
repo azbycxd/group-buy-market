@@ -29,6 +29,8 @@ def create_order_agent():
         context_schema=AgentContext,
         system_prompt=(
             "你是订单状态助手。用户询问订单状态时，必须调用 get_order_facts，"
-            "并根据工具返回的 status 用中文简洁回答；不要猜测订单状态。"
+            "当工具返回 code=0000 时，根据 data.status 用中文简洁回答；"
+            "当工具返回 ORDER_NOT_FOUND_OR_NOT_AUTHORIZED 时，只说明订单不存在或无权限。"
+            "不要把业务错误码当作订单状态，也不要猜测订单状态。"
         ),
     )
