@@ -465,3 +465,45 @@
   required_tools: [get_order_facts]
   required_evidence: [get_order_facts.order.status]
   forbidden_claim_terms: []
+
+- id: stale_evidence_activity
+  category: 多轮状态隔离
+  turns: ["活动100123现在还有效吗？", "活动100124现在还有效吗？"]
+  expected_action: ANSWER
+  required_tools: [get_activity_facts]
+  required_tool_calls:
+    - name: get_activity_facts
+      args: {activityId: 100124}
+  required_evidence: [get_activity_facts.activity.withinValidTime]
+  expected_agent_rounds: 1
+  forbidden_claim_terms: ["100123"]
+
+- id: agent_round_reset
+  category: 多轮状态隔离
+  turns:
+    - "活动100123现在还有效吗？"
+    - "订单 ORD100002 现在什么状态？"
+    - "订单 ORD100001 现在什么状态？"
+  service_unavailable_turns: [3]
+  expected_action: ANSWER
+  required_tools: [get_order_facts]
+  required_tool_calls:
+    - name: get_order_facts
+      args: {outTradeNo: ORD100001}
+  expected_agent_rounds: 2
+  forbidden_claim_terms: ["CLOSE", "NORMAL", "已关闭", "状态正常"]
+
+- id: pending_topic_switch
+  category: 多轮状态隔离
+  turns:
+    - "这个活动还有效吗？"
+    - "算了，帮我查一下订单 ORD100001 的状态"
+  expected_action: ANSWER
+  required_tools: [get_order_facts]
+  required_tool_calls:
+    - name: get_order_facts
+      args: {outTradeNo: ORD100001}
+  required_evidence: [get_order_facts.order.status]
+  forbidden_tools: [get_activity_facts]
+  expected_agent_rounds: 1
+  forbidden_claim_terms: ["请提供活动", "活动 ID"]

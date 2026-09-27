@@ -21,7 +21,13 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
 from agent_middleware import create_agent_middleware
-from evidence import Evidence, EvidenceType, merge_evidence
+from evidence import (
+    CLEAR_EVIDENCE,
+    Evidence,
+    EvidenceSignal,
+    EvidenceType,
+    merge_evidence,
+)
 from outcome import AgentOutcome, Claim, ClaimType, OutcomeKind
 from requirement_tracker import (
     CAPABILITY_TABLE,
@@ -94,13 +100,13 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
     understanding: Understanding
     parsed_entities: list[ParsedEntity]
-    requirement_status: RequirementStatus
+    requirement_status: RequirementStatus | None
     pending_needs: list[InformationNeed]
     pending_missing_entities: list[EntityType]
     missing_evidence: list[str]
     agent_rounds: int
     evidence: Annotated[list[Evidence], merge_evidence]
-    outcome: AgentOutcome
+    outcome: AgentOutcome | None
 
 
 def _create_model() -> ChatOpenAI:
@@ -281,6 +287,7 @@ def create_order_agent(
                 Understanding,
                 RequirementStatus,
                 Evidence,
+                EvidenceSignal,
                 EvidenceType,
                 AgentOutcome,
                 OutcomeKind,
@@ -308,26 +315,28 @@ def create_order_agent(
             and pending_needs
             and pending_missing
         ):
-            parsed_entities = _merge_entities(
-                state.get("parsed_entities", []),
-                resolve_pending_entities(user_text, pending_missing),
-            )
-            available_types = {
-                entity.entity_type for entity in parsed_entities
-            }
-            remaining = [
-                entity_type
-                for entity_type in pending_missing
-                if entity_type not in available_types
-            ]
-            return {
-                "understanding": Understanding(
-                    needs=pending_needs,
-                    entities=[],
-                ),
-                "parsed_entities": parsed_entities,
-                "pending_missing_entities": remaining,
-            }
+            recovered = resolve_pending_entities(user_text, pending_missing)
+            if recovered:
+                parsed_entities = _merge_entities(
+                    state.get("parsed_entities", []),
+                    recovered,
+                )
+                available_types = {
+                    entity.entity_type for entity in parsed_entities
+                }
+                remaining = [
+                    entity_type
+                    for entity_type in pending_missing
+                    if entity_type not in available_types
+                ]
+                return {
+                    "understanding": Understanding(
+                        needs=pending_needs,
+                        entities=[],
+                    ),
+                    "parsed_entities": parsed_entities,
+                    "pending_missing_entities": remaining,
+                }
 
         understanding, parsed_entities = understand_text(
             understander,
@@ -336,8 +345,13 @@ def create_order_agent(
         return {
             "understanding": understanding,
             "parsed_entities": parsed_entities,
+            "requirement_status": None,
             "pending_needs": [],
             "pending_missing_entities": [],
+            "missing_evidence": [],
+            "agent_rounds": 0,
+            "evidence": CLEAR_EVIDENCE,
+            "outcome": None,
         }
 
     def agent_node(

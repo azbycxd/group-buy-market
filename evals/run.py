@@ -178,18 +178,30 @@ def invoke_case(
     context = context_type(user_id=case.get("user_id", "demo-user"))
     turns = case.get("turns") or [case["input"]]
     session_id = session_id or f"eval-{case['id']}-{uuid.uuid4().hex}"
+    unavailable_turns = set(case.get("service_unavailable_turns", []))
+    original_base_url = os.environ.get("FAKE_JAVA_BASE_URL")
     result: dict[str, Any] = {}
     started_at = time.perf_counter()
 
-    for turn in turns:
-        result = agent.invoke(
-            {"messages": [HumanMessage(content=turn)]},
-            context=context,
-            config={
-                "callbacks": [counter],
-                "configurable": {"thread_id": session_id},
-            },
-        )
+    try:
+        for turn_number, turn in enumerate(turns, start=1):
+            if turn_number in unavailable_turns:
+                os.environ["FAKE_JAVA_BASE_URL"] = "http://127.0.0.1:1"
+            elif original_base_url is not None:
+                os.environ["FAKE_JAVA_BASE_URL"] = original_base_url
+            result = agent.invoke(
+                {"messages": [HumanMessage(content=turn)]},
+                context=context,
+                config={
+                    "callbacks": [counter],
+                    "configurable": {"thread_id": session_id},
+                },
+            )
+    finally:
+        if original_base_url is None:
+            os.environ.pop("FAKE_JAVA_BASE_URL", None)
+        else:
+            os.environ["FAKE_JAVA_BASE_URL"] = original_base_url
 
     return result, counter.total_tokens, time.perf_counter() - started_at
 
@@ -200,12 +212,13 @@ def evaluate_result(
     token_count: int,
     latency_seconds: float,
 ) -> EvalRun:
-    tool_calls = [
-        call["name"]
+    tool_call_records = [
+        call
         for message in result.get("messages", [])
         if isinstance(message, AIMessage)
         for call in message.tool_calls
     ]
+    tool_calls = [call["name"] for call in tool_call_records]
     evidence = result.get("evidence", [])
     evidence_paths = [item.path for item in evidence]
     evidence_types = {item.path: item.type for item in evidence}
@@ -236,6 +249,21 @@ def evaluate_result(
     ]
     if forbidden_tools:
         reasons.append(f"调用禁用 Tool: {', '.join(forbidden_tools)}")
+
+    missing_tool_calls = [
+        expected
+        for expected in case.get("required_tool_calls", [])
+        if not any(
+            call["name"] == expected["name"]
+            and call.get("args", {}) == expected.get("args", {})
+            for call in tool_call_records
+        )
+    ]
+    if missing_tool_calls:
+        reasons.append(
+            "缺少精确 Tool 调用: "
+            + json.dumps(missing_tool_calls, ensure_ascii=False)
+        )
 
     missing_evidence = [
         pattern
@@ -295,6 +323,16 @@ def evaluate_result(
                         f"{claim.type.value} Claim Evidence 类型错误: "
                         f"{', '.join(wrong_type)}"
                     )
+
+    expected_agent_rounds = case.get("expected_agent_rounds")
+    if (
+        expected_agent_rounds is not None
+        and result.get("agent_rounds") != expected_agent_rounds
+    ):
+        reasons.append(
+            "agent_rounds 期望 "
+            f"{expected_agent_rounds}，实际 {result.get('agent_rounds')}"
+        )
 
     return EvalRun(
         passed=not reasons,

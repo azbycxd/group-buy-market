@@ -12,6 +12,13 @@ class EvidenceType(StrEnum):
     RULE = "RULE"
 
 
+class EvidenceSignal(StrEnum):
+    CLEAR = "CLEAR_EVIDENCE"
+
+
+CLEAR_EVIDENCE = EvidenceSignal.CLEAR
+
+
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -22,8 +29,11 @@ class Evidence(BaseModel):
 
 def merge_evidence(
     current: list[Evidence],
-    incoming: list[Evidence],
+    incoming: list[Evidence] | EvidenceSignal,
 ) -> list[Evidence]:
+    if incoming == CLEAR_EVIDENCE:
+        return []
+
     merged: list[Evidence] = []
     seen: set[tuple[str, str, str]] = set()
     for item in [*current, *incoming]:
