@@ -103,24 +103,11 @@ def _fact_evidence(tool_name: str, data: Any) -> list[Evidence]:
     return evidence
 
 
-def _rule_query_is_traceable(query: Any, user_text: str) -> bool:
-    if not isinstance(query, str) or not query.strip():
-        return False
-    query_characters = set(re.findall(r"[a-z0-9\u4e00-\u9fff]", query.lower()))
-    user_characters = set(
-        re.findall(r"[a-z0-9\u4e00-\u9fff]", user_text.lower())
-    )
-    return bool(query_characters) and query_characters.issubset(user_characters)
-
-
 def _rule_evidence(
     tool_name: str,
     data: Any,
-    user_text: str,
 ) -> list[Evidence]:
     if not isinstance(data, dict) or not isinstance(data.get("matches"), list):
-        return []
-    if not _rule_query_is_traceable(data.get("query"), user_text):
         return []
     return [
         Evidence(
@@ -132,14 +119,16 @@ def _rule_evidence(
     ]
 
 
-def _collect_evidence(message: ToolMessage, user_text: str) -> list[Evidence]:
+def _collect_evidence(message: ToolMessage) -> list[Evidence]:
     payload = _parse_tool_payload(message)
     if payload is None:
         return []
     tool_name = message.name or ""
     data = payload.get("data")
     if tool_name == "search_group_buy_rules":
-        return _rule_evidence(tool_name, data, user_text)
+        if payload.get("code") != "0000":
+            return []
+        return _rule_evidence(tool_name, data)
     return _fact_evidence(tool_name, data)
 
 
@@ -362,10 +351,7 @@ def EvidenceCollector(request: Any, handler: Any) -> ToolMessage | Command[Any]:
     response = handler(request)
     if not isinstance(response, ToolMessage):
         return response
-    collected = _collect_evidence(
-        response,
-        getattr(request.runtime.context, "user_text", ""),
-    )
+    collected = _collect_evidence(response)
     if not collected:
         return response
     return Command(update={"messages": [response], "evidence": collected})
