@@ -67,7 +67,8 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         cls.user_b_token = cls._token("user-B")
         cls.fake_process: subprocess.Popen[bytes] | None = None
         cls.api_process: subprocess.Popen[bytes] | None = None
-        cls.api_log = (cls.temp_path / "api.log").open("w+b")
+        cls.api_log_path = cls.temp_path / "api.log"
+        cls.api_log = cls.api_log_path.open("w+b")
 
         environment = os.environ.copy()
         environment["FAKE_JAVA_DELAY_SECONDS"] = "0"
@@ -204,6 +205,13 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
             token=self.user_a_token,
         )
         self.assertEqual(proposal_events[-1]["data"]["kind"], "ANSWER")
+        proposed_index = next(
+            index
+            for index, event in enumerate(proposal_events)
+            if event["event"] == "action_proposed"
+        )
+        self.assertLess(proposed_index, len(proposal_events) - 1)
+        proposed = proposal_events[proposed_index]["data"]
         actions = [
             item
             for item in self.store.list_actions()
@@ -211,11 +219,18 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(actions), 1)
         action = actions[0]
-        credential = confirmation_credential(
-            action,
-            secret=self.confirm_secret,
+        credential = proposed["credential"]
+        self.assertEqual(proposed["action_id"], action["action_id"])
+        self.assertEqual(proposed["expires_at"], action["expires_at"])
+        self.assertEqual(proposed["preview"], PREVIEW)
+        self.assertNotIn(
+            credential,
+            proposal_events[-1]["data"]["answer"],
         )
-        self.assertIn(credential, proposal_events[-1]["data"]["answer"])
+        self.assertNotIn(
+            str(action["action_id"]),
+            proposal_events[-1]["data"]["answer"],
+        )
 
         events, _ = collect_sse(
             self.chat_url,
@@ -228,6 +243,36 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
             self.store.get_action(str(action["action_id"]))["status"],
             "PROPOSED",
         )
+        from agent import close_order_agent, create_order_agent
+
+        checkpoint_reader = create_order_agent(self.checkpoint_path)
+        try:
+            snapshot = checkpoint_reader.get_state(
+                {"configurable": {"thread_id": session_id}}
+            )
+            message_history = "\n".join(
+                str(message.content)
+                for message in snapshot.values.get("messages", [])
+            )
+        finally:
+            close_order_agent(checkpoint_reader)
+        self.assertNotIn(credential, message_history)
+
+        confirmed = self.confirm(action, credential=credential)
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+
+        credential_bytes = credential.encode("ascii")
+        checkpoint_files = list(
+            self.temp_path.glob("checkpoints.sqlite*")
+        )
+        self.assertTrue(checkpoint_files)
+        self.assertTrue(
+            all(
+                credential_bytes not in path.read_bytes()
+                for path in checkpoint_files
+            )
+        )
+        self.assertNotIn(credential_bytes, self.api_log_path.read_bytes())
 
     def test_11_changed_args_hash_is_rejected(self) -> None:
         action, _ = self.create_action()
@@ -247,6 +292,41 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
             response.json()["detail"]["code"],
             "ACTION_ARGS_CHANGED",
         )
+
+    def test_12_reused_proposal_emits_action_event(self) -> None:
+        session_id = f"sse-reuse-{uuid.uuid4().hex}"
+        payload = {
+            "session_id": session_id,
+            "message": "帮我把订单 ORD200001 退了",
+        }
+        first_events, _ = collect_sse(
+            self.chat_url,
+            payload,
+            token=self.user_a_token,
+        )
+        second_events, _ = collect_sse(
+            self.chat_url,
+            payload,
+            token=self.user_a_token,
+        )
+        first = next(
+            event["data"]
+            for event in first_events
+            if event["event"] == "action_proposed"
+        )
+        second = next(
+            event["data"]
+            for event in second_events
+            if event["event"] == "action_proposed"
+        )
+        self.assertEqual(first["action_id"], second["action_id"])
+        self.assertEqual(first["credential"], second["credential"])
+        actions = [
+            action
+            for action in self.store.list_actions()
+            if action["session_id"] == session_id
+        ]
+        self.assertEqual(len(actions), 1)
 
     def test_3_expired_credential_is_rejected(self) -> None:
         action, _ = self.create_action(

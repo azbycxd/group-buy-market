@@ -109,7 +109,9 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
         for _ in range(3):
             result = self.invoke("帮我把订单 ORD200001 退了")
             self.assertEqual(result["outcome"].kind, OutcomeKind.ANSWER)
-            self.assertIn("action_id", result["outcome"].final_answer)
+            self.assertIn("已生成退款提议", result["outcome"].final_answer)
+            self.assertNotIn("action_id", result["outcome"].final_answer)
+            self.assertNotIn("确认凭证", result["outcome"].final_answer)
             self.assertIn("没有执行任何退款", result["outcome"].final_answer)
         created = self.actions()[before:]
         self.assertEqual(len(created), 3)

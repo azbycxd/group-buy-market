@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from action_ledger import (
     AgentActionStore,
     action_args_hash_is_current,
+    confirmation_credential,
     credential_matches,
     required_confirmation_secret,
 )
@@ -214,7 +215,7 @@ class ToolProgressCallback(BaseCallbackHandler):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[dict[str, str]],
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]],
     ) -> None:
         self._loop = loop
         self._queue = queue
@@ -238,7 +239,7 @@ class ToolProgressCallback(BaseCallbackHandler):
             self._emitted += 1
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
-            _tool_progress(tool_name),
+            ("progress", _tool_progress(tool_name)),
         )
 
 
@@ -253,10 +254,44 @@ def _tool_names(update: Any) -> list[str]:
     return names
 
 
+def _action_proposed_payload(
+    store: AgentActionStore,
+    *,
+    action_id: str,
+    session_id: str,
+    user_id: str,
+) -> dict[str, Any] | None:
+    action = store.get_action(action_id)
+    if (
+        action is None
+        or action.get("session_id") != session_id
+        or action.get("user_id") != user_id
+        or action.get("status") != "PROPOSED"
+        or not action_args_hash_is_current(action)
+    ):
+        return None
+    try:
+        preview = json.loads(str(action["preview_json"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(preview, dict):
+        return None
+    return {
+        "action_id": action_id,
+        "credential": confirmation_credential(
+            action,
+            secret=required_confirmation_secret(),
+        ),
+        "expires_at": action["expires_at"],
+        "preview": preview,
+    }
+
+
 async def _run_agent(
     agent: Any,
     payload: ChatStreamRequest,
-    queue: asyncio.Queue[dict[str, str]],
+    queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    action_store: AgentActionStore,
     user_id: str,
     request_id: str,
 ) -> AgentOutcome:
@@ -284,11 +319,27 @@ async def _run_agent(
         agent_update = update.get("agent")
         if callback.emitted == 0:
             for tool_name in _tool_names(agent_update):
-                queue.put_nowait(_tool_progress(tool_name))
+                queue.put_nowait(("progress", _tool_progress(tool_name)))
         for node_name in ("finalize", "propose_refund"):
             node_update = update.get(node_name)
             if isinstance(node_update, dict) and node_update.get("outcome"):
                 outcome = AgentOutcome.model_validate(node_update["outcome"])
+            if node_name != "propose_refund" or not isinstance(
+                node_update,
+                dict,
+            ):
+                continue
+            action_id = node_update.get("proposed_action_id")
+            if not isinstance(action_id, str) or not action_id:
+                continue
+            action_event = _action_proposed_payload(
+                action_store,
+                action_id=action_id,
+                session_id=payload.session_id,
+                user_id=user_id,
+            )
+            if action_event is not None:
+                queue.put_nowait(("action_proposed", action_event))
 
     if outcome is None:
         snapshot = await agent.aget_state(config)
@@ -406,7 +457,9 @@ def create_app(
             )
 
         async def event_stream() -> AsyncIterator[bytes]:
-            queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+            queue: asyncio.Queue[
+                tuple[str, dict[str, Any]]
+            ] = asyncio.Queue()
             execution: asyncio.Task[AgentOutcome] | None = None
             started_at = asyncio.get_running_loop().time()
             disconnected_recorded = False
@@ -423,6 +476,7 @@ def create_app(
                         app.state.agent,
                         payload,
                         queue,
+                        app.state.action_store,
                         user_id,
                         request_id,
                     )
@@ -480,13 +534,15 @@ def create_app(
                         return
 
                     if not queue.empty():
-                        yield _sse("progress", queue.get_nowait())
+                        event_name, event_data = queue.get_nowait()
+                        yield _sse(event_name, event_data)
                         continue
 
                     if execution.done():
                         outcome = execution.result()
                         while not queue.empty():
-                            yield _sse("progress", queue.get_nowait())
+                            event_name, event_data = queue.get_nowait()
+                            yield _sse(event_name, event_data)
                         _record_execution(
                             app,
                             payload.session_id,
@@ -504,13 +560,13 @@ def create_app(
                         return
 
                     try:
-                        progress = await asyncio.wait_for(
+                        event_name, event_data = await asyncio.wait_for(
                             queue.get(),
                             timeout=min(DISCONNECT_POLL_SECONDS, remaining),
                         )
                     except TimeoutError:
                         continue
-                    yield _sse("progress", progress)
+                    yield _sse(event_name, event_data)
             except asyncio.CancelledError:
                 if not disconnected_recorded:
                     _record_execution(

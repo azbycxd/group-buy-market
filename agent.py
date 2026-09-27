@@ -23,11 +23,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
-from action_ledger import (
-    AgentActionStore,
-    confirmation_credential,
-    required_confirmation_secret,
-)
+from action_ledger import AgentActionStore
 from agent_middleware import create_agent_middleware
 from confirmation_workflow import start_confirmation_workflow
 from evidence import (
@@ -118,6 +114,7 @@ class AgentState(TypedDict, total=False):
     agent_rounds: int
     evidence: Annotated[list[Evidence], merge_evidence]
     outcome: AgentOutcome | None
+    proposed_action_id: str | None
 
 
 def _create_model() -> ChatOpenAI:
@@ -464,6 +461,7 @@ def _compile_order_agent(
             "agent_rounds": 0,
             "evidence": CLEAR_EVIDENCE,
             "outcome": None,
+            "proposed_action_id": None,
         }
 
     def agent_node(
@@ -590,6 +588,7 @@ def _compile_order_agent(
 
         preview = RefundPreviewFacts.model_validate(preview_result["data"])
         evidence = _refund_evidence(order_result, preview)
+        proposed_action_id: str | None = None
         common_texts = [
             "当前仅生成只读退款预览，没有执行任何退款。",
             (
@@ -636,7 +635,6 @@ def _compile_order_agent(
                 )
             else:
                 try:
-                    confirm_secret = required_confirmation_secret()
                     action_store = AgentActionStore()
                     action, created = action_store.create_or_reuse_refund_proposal(
                         session_id=session_id,
@@ -653,32 +651,20 @@ def _compile_order_agent(
                             checkpoint_path,
                             action,
                         )
-                    credential = confirmation_credential(
-                        action,
-                        secret=confirm_secret,
-                    )
                 except (sqlite3.Error, OSError, RuntimeError, ValueError):
                     outcome = _capability_outcome(
                         OutcomeKind.HANDOFF,
                         "退款提议或确认流程暂时不可用，未执行任何退款。",
                     )
                 else:
-                    action_id = str(action["action_id"])
-                    proposal_text = (
-                        "已复用尚未过期的退款提议"
-                        if not created
-                        else "已生成只读退款提议"
-                    )
+                    proposed_action_id = str(action["action_id"])
                     outcome = _refund_outcome(
                         kind=OutcomeKind.ANSWER,
                         preview=preview,
                         capability_texts=[
-                            f"{proposal_text}，action_id：{action_id}。",
                             (
-                                "确认凭证："
-                                f"{credential}；有效期至 {action['expires_at']}。"
-                                "该凭证只能提交到确认 HTTP 接口，"
-                                "在普通聊天中说“我确认”不会生效。"
+                                "已生成退款提议，请在 5 分钟内通过确认操作"
+                                "完成确认。在普通聊天中说“我确认”不会生效。"
                             ),
                             (
                                 "如果未来由用户确认，将为订单 "
@@ -697,6 +683,7 @@ def _compile_order_agent(
             "missing_evidence": [],
             "evidence": evidence,
             "outcome": outcome,
+            "proposed_action_id": proposed_action_id,
             "messages": [AIMessage(content=outcome.final_answer)],
         }
 
