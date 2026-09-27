@@ -59,10 +59,15 @@ CAPABILITY_TABLE: dict[InformationNeed, Capability] = {
             "系统只能看到拼团订单状态，无法确认支付渠道资金到账情况。"
         ),
     ),
-    InformationNeed.REFUND_REQUEST: Capability(
+    InformationNeed.REFUND_POLICY: Capability(
         supported=True,
         required_entities=(),
         required_evidence=("search_group_buy_rules.matches.*",),
+    ),
+    InformationNeed.REFUND_REQUEST: Capability(
+        supported=True,
+        required_entities=(EntityType.ORDER,),
+        required_evidence=(),
     ),
     InformationNeed.OUT_OF_SCOPE: Capability(
         supported=False,

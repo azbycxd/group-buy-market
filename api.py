@@ -191,9 +191,10 @@ async def _run_agent(
         if callback.emitted == 0:
             for tool_name in _tool_names(agent_update):
                 queue.put_nowait(_tool_progress(tool_name))
-        finalize_update = update.get("finalize")
-        if isinstance(finalize_update, dict) and finalize_update.get("outcome"):
-            outcome = AgentOutcome.model_validate(finalize_update["outcome"])
+        for node_name in ("finalize", "propose_refund"):
+            node_update = update.get(node_name)
+            if isinstance(node_update, dict) and node_update.get("outcome"):
+                outcome = AgentOutcome.model_validate(node_update["outcome"])
 
     if outcome is None:
         snapshot = await agent.aget_state(config)

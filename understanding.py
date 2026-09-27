@@ -17,6 +17,7 @@ class InformationNeed(StrEnum):
     USER_ELIGIBILITY = "USER_ELIGIBILITY"
     JOINABLE_TEAMS = "JOINABLE_TEAMS"
     RULE_EXPLANATION = "RULE_EXPLANATION"
+    REFUND_POLICY = "REFUND_POLICY"
     REFUND_ARRIVAL = "REFUND_ARRIVAL"
     REFUND_REQUEST = "REFUND_REQUEST"
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
@@ -66,15 +67,18 @@ needs 只能从以下类型选择：
 - USER_ELIGIBILITY：查询当前用户资格、次数，或分析为什么不能参加。
 - JOINABLE_TEAMS：查询是否存在可加入团队，或分析为什么不能参加。
 - RULE_EXPLANATION：解释拼团规则。
+- REFUND_POLICY：咨询怎么退款、退款流程或退款条件，不要求立即处理具体订单。
 - REFUND_ARRIVAL：查询退款是否到账、何时到账。
-- REFUND_REQUEST：询问如何申请退款或退款条件。
-- OUT_OF_SCOPE：要求修改、创建、取消业务数据，或不属于上述只读拼团咨询。
+- REFUND_REQUEST：明确要求为一个具体订单发起退款，例如“帮我退订单 X”。
+- OUT_OF_SCOPE：要求修改、创建、取消其他业务数据，或不属于上述拼团咨询。
 
 分类规则：
 1. “为什么/为啥不能参加某活动”是综合诊断，同时选择 ACTIVITY_VALIDITY、USER_ELIGIBILITY、JOINABLE_TEAMS。
 2. 明确要求修改订单状态等写操作时，只返回 OUT_OF_SCOPE，不要同时返回 ORDER_STATUS。
-3. 查询退款到账选择 REFUND_ARRIVAL；咨询退款申请方法或条件选择 REFUND_REQUEST。
-4. 一个问题确实包含多个独立需求时可返回多个 needs。
+3. 查询退款到账选择 REFUND_ARRIVAL。
+4. “怎么退款/如何申请退款/退款条件是什么”选择 REFUND_POLICY。
+5. “帮我退订单 X/给订单 X 办理退款”选择 REFUND_REQUEST，不要选择 OUT_OF_SCOPE。
+6. 一个问题确实包含多个独立需求时可返回多个 needs。
 
 entities 只能包含 entity_type 和 source_text：
 - 订单号用 ORDER，活动编号用 ACTIVITY。

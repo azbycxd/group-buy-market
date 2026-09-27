@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -89,6 +89,26 @@ class UserEligibilityFacts(FactsModel):
     participation_limit_reached: StrictBool = Field(alias="participationLimitReached")
     market_downgraded: StrictBool = Field(alias="marketDowngraded")
     user_within_release_range: StrictBool = Field(alias="userWithinReleaseRange")
+
+
+class RefundPreviewFacts(FactsModel):
+    order_status: Literal["CREATE", "COMPLETE", "CLOSE"] = Field(
+        alias="orderStatus"
+    )
+    team_status: Literal[
+        "PROGRESS",
+        "COMPLETE",
+        "FAIL",
+        "COMPLETE_FAIL",
+    ] = Field(alias="teamStatus")
+    refund_type: Literal[
+        "UNPAID",
+        "PAID_UNFORMED",
+        "PAID_FORMED",
+    ] = Field(alias="refundType")
+    refund_proposal_allowed: StrictBool = Field(alias="refundProposalAllowed")
+    requires_manual_review: StrictBool = Field(alias="requiresManualReview")
+    order_update_time: StrictStr = Field(alias="orderUpdateTime")
 
 
 class RuleMatch(FactsModel):

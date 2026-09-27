@@ -15,6 +15,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -22,6 +23,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
+from action_ledger import AgentActionStore
 from agent_middleware import create_agent_middleware
 from evidence import (
     CLEAR_EVIDENCE,
@@ -42,6 +44,8 @@ from tools.context import AgentContext
 from tools.eligibility_facts import get_user_eligibility_facts
 from tools.joinable_team_facts import get_joinable_team_facts
 from tools.order_facts import get_order_facts
+from tools.facts import RefundPreviewFacts
+from tools.refund_preview import get_refund_preview
 from tools.rule_search import search_group_buy_rules
 from understanding import (
     EntityType,
@@ -270,6 +274,107 @@ def _merge_entities(
     return list(merged.values())
 
 
+def _refund_evidence(
+    order_result: dict[str, object],
+    preview: RefundPreviewFacts,
+) -> list[Evidence]:
+    order_data = order_result.get("data")
+    order_status = None
+    if isinstance(order_data, dict) and isinstance(order_data.get("order"), dict):
+        order_status = order_data["order"].get("status")
+    return [
+        Evidence(
+            path="get_order_facts.order.status",
+            type=EvidenceType.FACT,
+            value=order_status,
+        ),
+        Evidence(
+            path="refund_preview.orderStatus",
+            type=EvidenceType.FACT,
+            value=preview.order_status,
+        ),
+        Evidence(
+            path="refund_preview.teamStatus",
+            type=EvidenceType.FACT,
+            value=preview.team_status,
+        ),
+        Evidence(
+            path="refund_preview.refundType",
+            type=EvidenceType.FACT,
+            value=preview.refund_type,
+        ),
+        Evidence(
+            path="refund_preview.refundProposalAllowed",
+            type=EvidenceType.FACT,
+            value=preview.refund_proposal_allowed,
+        ),
+        Evidence(
+            path="refund_preview.requiresManualReview",
+            type=EvidenceType.FACT,
+            value=preview.requires_manual_review,
+        ),
+        Evidence(
+            path="refund_preview.orderUpdateTime",
+            type=EvidenceType.FACT,
+            value=preview.order_update_time,
+        ),
+    ]
+
+
+def _refund_outcome(
+    *,
+    kind: OutcomeKind,
+    preview: RefundPreviewFacts,
+    capability_texts: list[str],
+    evidence: list[Evidence],
+) -> AgentOutcome:
+    claims = [
+        Claim(
+            text=f"当前订单状态：{preview.order_status}。",
+            type=ClaimType.FACT,
+            evidence=["refund_preview.orderStatus"],
+        ),
+        Claim(
+            text=f"退款类型：{preview.refund_type}。",
+            type=ClaimType.FACT,
+            evidence=["refund_preview.refundType"],
+        ),
+        *[
+            Claim(text=text, type=ClaimType.CAPABILITY, evidence=[])
+            for text in capability_texts
+        ],
+    ]
+    outcome = AgentOutcome(
+        kind=kind,
+        claims=claims,
+        final_answer="\n".join(claim.text for claim in claims),
+    )
+    if _claim_errors(outcome, evidence):
+        return _capability_outcome(
+            OutcomeKind.HANDOFF,
+            "退款预览无法与查询事实对应，已转人工客服核实。",
+        )
+    return outcome
+
+
+def _refund_failure_outcome(result: dict[str, object]) -> AgentOutcome:
+    code = result.get("code")
+    if code == "ORDER_NOT_FOUND_OR_NOT_AUTHORIZED":
+        return _capability_outcome(
+            OutcomeKind.HANDOFF,
+            "订单不存在或无权限，无法生成退款提议，请联系人工客服核实。",
+        )
+    if code in {"SERVICE_UNAVAILABLE", "INVALID_TOOL_RESPONSE"}:
+        return _capability_outcome(
+            OutcomeKind.ANSWER,
+            "业务服务暂时不可用，暂时无法生成退款提议。C1 未执行任何退款。",
+        )
+    return _capability_outcome(
+        OutcomeKind.HANDOFF,
+        "暂时无法核实退款预览，已转人工客服处理。C1 未执行任何退款。",
+    )
+
+
 def _checkpoint_serde() -> JsonPlusSerializer:
     return JsonPlusSerializer(
         allowed_msgpack_modules=[
@@ -396,6 +501,166 @@ def _compile_order_agent(checkpointer: object):
             "evidence": result.get("evidence", []),
         }
 
+    def propose_refund_node(
+        state: AgentState,
+        runtime: Runtime[AgentContext],
+        config: RunnableConfig,
+    ) -> dict[str, object]:
+        decision = tracker.evaluate(
+            needs=state["understanding"].needs,
+            entities=state.get("parsed_entities", []),
+            evidence=state.get("evidence", []),
+        )
+        if decision.status is RequirementStatus.NEED_USER_INPUT:
+            outcome = _capability_outcome(
+                OutcomeKind.REQUEST_INPUT,
+                _request_input(decision),
+            )
+            return {
+                "requirement_status": decision.status,
+                "pending_needs": list(state["understanding"].needs),
+                "pending_missing_entities": list(decision.missing_entities),
+                "missing_evidence": [],
+                "outcome": outcome,
+                "messages": [AIMessage(content=outcome.final_answer)],
+            }
+
+        order_entity = next(
+            (
+                entity
+                for entity in state.get("parsed_entities", [])
+                if entity.entity_type is EntityType.ORDER
+            ),
+            None,
+        )
+        if order_entity is None or not isinstance(order_entity.value, str):
+            outcome = _capability_outcome(
+                OutcomeKind.REQUEST_INPUT,
+                "请提供订单号，以便生成退款预览。",
+            )
+            return {
+                "requirement_status": RequirementStatus.NEED_USER_INPUT,
+                "pending_needs": [InformationNeed.REFUND_REQUEST],
+                "pending_missing_entities": [EntityType.ORDER],
+                "outcome": outcome,
+                "messages": [AIMessage(content=outcome.final_answer)],
+            }
+
+        order_result = get_order_facts.func(
+            outTradeNo=order_entity.value,
+            runtime=runtime,
+        )
+        if order_result.get("success") is not True:
+            outcome = _refund_failure_outcome(order_result)
+            return {
+                "requirement_status": RequirementStatus.ANSWERABLE,
+                "pending_needs": [],
+                "pending_missing_entities": [],
+                "outcome": outcome,
+                "messages": [AIMessage(content=outcome.final_answer)],
+            }
+
+        preview_result = get_refund_preview(
+            out_trade_no=order_entity.value,
+            user_id=runtime.context.user_id,
+            request_id=runtime.context.request_id,
+        )
+        if preview_result.get("success") is not True:
+            outcome = _refund_failure_outcome(preview_result)
+            return {
+                "requirement_status": RequirementStatus.ANSWERABLE,
+                "pending_needs": [],
+                "pending_missing_entities": [],
+                "outcome": outcome,
+                "messages": [AIMessage(content=outcome.final_answer)],
+            }
+
+        preview = RefundPreviewFacts.model_validate(preview_result["data"])
+        evidence = _refund_evidence(order_result, preview)
+        common_texts = [
+            "C1 当前仅生成只读退款预览，没有执行任何退款。",
+            (
+                "退款资金是否到账不在当前系统事实范围内，"
+                "本系统不承诺退款到账。"
+            ),
+        ]
+
+        if (
+            preview.order_status == "CLOSE"
+            or not preview.refund_proposal_allowed
+        ):
+            outcome = _refund_outcome(
+                kind=OutcomeKind.HANDOFF,
+                preview=preview,
+                capability_texts=[
+                    "该订单不能再次退款，未写入 PROPOSED 退款提议。",
+                    *common_texts,
+                ],
+                evidence=evidence,
+            )
+        elif preview.requires_manual_review:
+            outcome = _refund_outcome(
+                kind=OutcomeKind.HANDOFF,
+                preview=preview,
+                capability_texts=[
+                    (
+                        "该退款需要人工审核；只有审核通过并在未来确认后，"
+                        f"才会按 {preview.refund_type} 路径发起退款操作。"
+                    ),
+                    "当前未写入可确认的 PROPOSED 退款提议。",
+                    *common_texts,
+                ],
+                evidence=evidence,
+            )
+        else:
+            session_id = str(
+                config.get("configurable", {}).get("thread_id", "")
+            )
+            if not session_id:
+                outcome = _capability_outcome(
+                    OutcomeKind.HANDOFF,
+                    "缺少会话标识，无法记录退款提议。C1 未执行任何退款。",
+                )
+            else:
+                try:
+                    action_id = AgentActionStore().create_refund_proposal(
+                        session_id=session_id,
+                        user_id=runtime.context.user_id,
+                        out_trade_no=order_entity.value,
+                        preview=preview.model_dump(mode="json", by_alias=True),
+                        expected_version=preview.order_update_time,
+                    )
+                except sqlite3.Error:
+                    outcome = _capability_outcome(
+                        OutcomeKind.HANDOFF,
+                        "退款提议台账暂时不可用。C1 未执行任何退款。",
+                    )
+                else:
+                    outcome = _refund_outcome(
+                        kind=OutcomeKind.ANSWER,
+                        preview=preview,
+                        capability_texts=[
+                            f"已生成只读退款提议，action_id：{action_id}。",
+                            (
+                                "如果未来由用户确认，将为订单 "
+                                f"{order_entity.value} 按 {preview.refund_type} "
+                                "路径发起退款操作。"
+                            ),
+                            *common_texts,
+                        ],
+                        evidence=evidence,
+                    )
+
+        return {
+            "requirement_status": RequirementStatus.ANSWERABLE,
+            "pending_needs": [],
+            "pending_missing_entities": [],
+            "missing_evidence": [],
+            "evidence": evidence,
+            "outcome": outcome,
+            "messages": [AIMessage(content=outcome.final_answer)],
+        }
+
     def answer_outcome(state: AgentState) -> AgentOutcome:
         evidence = state.get("evidence", [])
         draft_answer = _latest_draft_answer(state["messages"])
@@ -500,12 +765,27 @@ def _compile_order_agent(checkpointer: object):
             return "agent"
         return "end"
 
+    def route_after_understand(state: AgentState) -> str:
+        needs = state["understanding"].needs
+        if (
+            InformationNeed.REFUND_REQUEST in needs
+            and InformationNeed.OUT_OF_SCOPE not in needs
+        ):
+            return "propose_refund"
+        return "agent"
+
     graph = StateGraph(AgentState, context_schema=AgentContext)
     graph.add_node("understand", understand_node)
     graph.add_node("agent", agent_node)
+    graph.add_node("propose_refund", propose_refund_node)
     graph.add_node("finalize", finalize_node)
     graph.add_edge(START, "understand")
-    graph.add_edge("understand", "agent")
+    graph.add_conditional_edges(
+        "understand",
+        route_after_understand,
+        {"propose_refund": "propose_refund", "agent": "agent"},
+    )
+    graph.add_edge("propose_refund", END)
     graph.add_edge("agent", "finalize")
     graph.add_conditional_edges(
         "finalize",

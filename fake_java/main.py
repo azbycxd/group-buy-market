@@ -12,6 +12,7 @@ from tools.facts import (
     FactsEnvelope,
     JoinableTeamFacts,
     OrderFacts,
+    RefundPreviewFacts,
     UserEligibilityFacts,
 )
 
@@ -63,6 +64,64 @@ ORDERS: dict[str, dict[str, Any]] = {
             "activity": {"status": "EFFECTIVE"},
             "references": {"teamId": "18781390", "activityId": 100123},
         },
+    },
+    "ORD200001": {
+        "owner": "demo-user",
+        "data": {
+            "order": {"status": "COMPLETE"},
+            "team": {
+                "status": "PROGRESS",
+                "targetCount": 3,
+                "lockCount": 0,
+                "completeCount": 2,
+                "validEndTime": "2026-12-31T23:59:59+08:00",
+            },
+            "activity": {"status": "EFFECTIVE"},
+            "references": {"teamId": "18781401", "activityId": 100123},
+        },
+    },
+    "ORD200002": {
+        "owner": "demo-user",
+        "data": {
+            "order": {"status": "COMPLETE"},
+            "team": {
+                "status": "COMPLETE",
+                "targetCount": 3,
+                "lockCount": 0,
+                "completeCount": 3,
+                "validEndTime": "2026-12-31T23:59:59+08:00",
+            },
+            "activity": {"status": "EFFECTIVE"},
+            "references": {"teamId": "18781402", "activityId": 100123},
+        },
+    },
+}
+
+
+REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
+    "ORD100001": {
+        "orderStatus": "CLOSE",
+        "teamStatus": "PROGRESS",
+        "refundType": "PAID_UNFORMED",
+        "refundProposalAllowed": False,
+        "requiresManualReview": False,
+        "orderUpdateTime": "2026-09-27T09:00:00+08:00",
+    },
+    "ORD200001": {
+        "orderStatus": "COMPLETE",
+        "teamStatus": "PROGRESS",
+        "refundType": "PAID_UNFORMED",
+        "refundProposalAllowed": True,
+        "requiresManualReview": False,
+        "orderUpdateTime": "2026-09-27T10:00:00+08:00",
+    },
+    "ORD200002": {
+        "orderStatus": "COMPLETE",
+        "teamStatus": "COMPLETE",
+        "refundType": "PAID_FORMED",
+        "refundProposalAllowed": True,
+        "requiresManualReview": True,
+        "orderUpdateTime": "2026-09-27T11:00:00+08:00",
     },
 }
 
@@ -250,6 +309,25 @@ async def get_order_facts(
             )
         )
     return delayed_response(success(OrderFacts.model_validate(order["data"])))
+
+
+@app.post("/api/v1/agent/order/refund/preview")
+async def get_refund_preview(
+    request: OrderFactsRequest,
+    user_id: UserHeader = None,
+) -> Any:
+    order = ORDERS.get(request.outTradeNo)
+    preview = REFUND_PREVIEWS.get(request.outTradeNo)
+    if order is None or preview is None or order["owner"] != user_id:
+        return delayed_response(
+            business_error(
+                "ORDER_NOT_FOUND_OR_NOT_AUTHORIZED",
+                "订单不存在或无权限",
+            )
+        )
+    return delayed_response(
+        success(RefundPreviewFacts.model_validate(preview))
+    )
 
 
 @app.post("/api/v1/agent/activity/facts")
