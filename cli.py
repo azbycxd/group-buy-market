@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, ToolMessage
 
 from agent import create_order_agent
-from tools.order_facts import AgentContext
+from tools.context import AgentContext
 
 
 def _format_tool_call(name: str, args: dict[str, Any]) -> str:
@@ -28,10 +28,15 @@ def _tool_result(content: Any) -> str:
 
     if isinstance(parsed, dict):
         if parsed.get("code") != "0000":
-            return f"code={parsed.get('code')}, info={parsed.get('info')}"
+            detail = parsed.get("message", parsed.get("info"))
+            return f"code={parsed.get('code')}, message={detail}"
         data = parsed.get("data")
-        if isinstance(data, dict) and "status" in data:
-            return f"status={data['status']}"
+        if isinstance(data, dict):
+            order = data.get("order")
+            if isinstance(order, dict) and "status" in order:
+                return f"status={order['status']}"
+            if "status" in data:
+                return f"status={data['status']}"
     return str(parsed)
 
 

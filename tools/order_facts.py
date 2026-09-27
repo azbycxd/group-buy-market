@@ -1,13 +1,8 @@
-import os
-from dataclasses import dataclass
-
-import httpx
 from langchain.tools import ToolRuntime, tool
 
-
-@dataclass
-class AgentContext:
-    user_id: str
+from tools.context import AgentContext
+from tools.facts import OrderFacts
+from tools.facts_client import query_facts
 
 
 @tool
@@ -16,14 +11,9 @@ def get_order_facts(
     runtime: ToolRuntime[AgentContext],
 ) -> dict[str, object]:
     """查询订单事实；参数是要查询的外部交易订单号。"""
-    base_url = os.getenv("FAKE_JAVA_BASE_URL", "http://127.0.0.1:8000")
-    response = httpx.post(
-        f"{base_url.rstrip('/')}/api/v1/agent/order/facts",
-        json={"outTradeNo": outTradeNo},
-        headers={
-            "X-Dev-Authenticated-User-Id": runtime.context.user_id,
-        },
-        timeout=10.0,
+    return query_facts(
+        path="/api/v1/agent/order/facts",
+        body={"outTradeNo": outTradeNo},
+        user_id=runtime.context.user_id,
+        data_model=OrderFacts,
     )
-    response.raise_for_status()
-    return response.json()

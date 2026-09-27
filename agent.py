@@ -4,10 +4,15 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from tools.order_facts import AgentContext, get_order_facts
+from tools.activity_facts import get_activity_facts
+from tools.context import AgentContext
+from tools.eligibility_facts import get_user_eligibility_facts
+from tools.joinable_team_facts import get_joinable_team_facts
+from tools.order_facts import get_order_facts
+from tools.rule_search import search_group_buy_rules
 
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 def _required_env(name: str) -> str:
@@ -25,12 +30,20 @@ def create_order_agent():
     )
     return create_agent(
         model=model,
-        tools=[get_order_facts],
+        tools=[
+            get_order_facts,
+            get_activity_facts,
+            get_user_eligibility_facts,
+            get_joinable_team_facts,
+            search_group_buy_rules,
+        ],
         context_schema=AgentContext,
         system_prompt=(
-            "你是订单状态助手。用户询问订单状态时，必须调用 get_order_facts，"
-            "当工具返回 code=0000 时，根据 data.status 用中文简洁回答；"
+            "你是拼团诊断助手，应根据用户问题调用相关只读工具。"
+            "用户询问订单状态时，必须调用 get_order_facts，"
+            "当工具返回 code=0000 时，根据 data.order.status 用中文简洁回答；"
             "当工具返回 ORDER_NOT_FOUND_OR_NOT_AUTHORIZED 时，只说明订单不存在或无权限。"
             "不要把业务错误码当作订单状态，也不要猜测订单状态。"
+            "业务服务暂时不可用时必须如实说明“暂时无法查询”，禁止猜测业务状态。"
         ),
     )
