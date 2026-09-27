@@ -65,6 +65,8 @@ OUTCOME_PROMPT = """你是最终回答结构化节点。根据草稿回答和 Ev
 - 将草稿中的业务事实或规则结论写入 claims。
 - FACT Claim 只能逐字引用清单中 type=FACT 的 path。
 - RULE Claim 只能逐字引用清单中 type=RULE 的 path。
+- 没有对应类型 Evidence 时，不得生成该类型 Claim，必须从最终回答删除该结论。
+- 状态类 FACT 只能陈述查询到的状态；没有 RULE Evidence 时，不得推导该状态对应的业务后果。
 - CAPABILITY Claim 用于能力边界或服务可用性，可以不引用 Evidence。
 - 不得创造、改写或猜测 Evidence path。
 - final_answer 使用中文简洁回答用户问题。
@@ -197,42 +199,22 @@ def _claim_errors(outcome: AgentOutcome, evidence: list[Evidence]) -> list[str]:
     return errors
 
 
-def _evidence_backed_outcome(
-    draft_answer: str,
+def _validated_answer_outcome(
+    generated: AgentOutcome,
     evidence: list[Evidence],
 ) -> AgentOutcome:
-    claims: list[Claim] = []
-    fact_paths = [
-        item.path for item in evidence if item.type is EvidenceType.FACT
-    ]
-    rule_paths = [
-        item.path for item in evidence if item.type is EvidenceType.RULE
-    ]
-    if fact_paths:
-        claims.append(
-            Claim(
-                text=draft_answer,
-                type=ClaimType.FACT,
-                evidence=fact_paths,
-            )
-        )
-    if rule_paths:
-        claims.append(
-            Claim(
-                text=draft_answer,
-                type=ClaimType.RULE,
-                evidence=rule_paths,
-            )
-        )
-    if not claims:
+    if generated.kind is not OutcomeKind.ANSWER or _claim_errors(
+        generated,
+        evidence,
+    ):
         return _capability_outcome(
             OutcomeKind.HANDOFF,
-            "最终结论缺少可验证证据，请联系人工客服处理。",
+            "回答中的结论无法与查询到的事实对应，已转人工客服核实。",
         )
-    return AgentOutcome(
-        kind=OutcomeKind.ANSWER,
-        claims=claims,
-        final_answer=draft_answer,
+    return generated.model_copy(
+        update={
+            "final_answer": "\n".join(claim.text for claim in generated.claims)
+        }
     )
 
 
@@ -346,11 +328,7 @@ def create_order_agent():
                 ),
             ]
         )
-        if generated.kind is not OutcomeKind.ANSWER:
-            return _evidence_backed_outcome(draft_answer, evidence)
-        if _claim_errors(generated, evidence):
-            return _evidence_backed_outcome(draft_answer, evidence)
-        return generated
+        return _validated_answer_outcome(generated, evidence)
 
     def finalize_node(state: AgentState) -> dict[str, object]:
         decision = tracker.evaluate(
