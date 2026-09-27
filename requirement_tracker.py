@@ -19,6 +19,7 @@ class Capability:
     supported: bool
     required_entities: tuple[EntityType, ...]
     required_evidence: tuple[str, ...]
+    unsupported_reason: str | None = None
 
 
 CAPABILITY_TABLE: dict[InformationNeed, Capability] = {
@@ -51,16 +52,20 @@ CAPABILITY_TABLE: dict[InformationNeed, Capability] = {
         supported=False,
         required_entities=(EntityType.ORDER,),
         required_evidence=(),
+        unsupported_reason=(
+            "系统只能看到拼团订单状态，无法确认支付渠道资金到账情况。"
+        ),
     ),
     InformationNeed.REFUND_REQUEST: Capability(
-        supported=False,
+        supported=True,
         required_entities=(),
-        required_evidence=(),
+        required_evidence=("search_group_buy_rules",),
     ),
     InformationNeed.OUT_OF_SCOPE: Capability(
         supported=False,
         required_entities=(),
         required_evidence=(),
+        unsupported_reason="当前系统只支持拼团只读查询，无法执行该请求。",
     ),
 }
 

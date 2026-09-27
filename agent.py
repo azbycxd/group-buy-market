@@ -195,9 +195,15 @@ def create_order_agent():
         }
 
         if decision.status is RequirementStatus.UNSUPPORTED:
+            reasons = [
+                CAPABILITY_TABLE[need].unsupported_reason
+                for need in decision.unsupported_needs
+                if CAPABILITY_TABLE[need].unsupported_reason
+            ]
+            reason = "".join(reasons) or "该请求超出当前拼团诊断能力范围。"
             update["messages"] = [
                 AIMessage(
-                    content="该请求超出当前只读拼团诊断能力范围，请联系人工客服处理。"
+                    content=f"{reason}请联系人工客服处理。"
                 )
             ]
         elif decision.status is RequirementStatus.NEED_USER_INPUT:
