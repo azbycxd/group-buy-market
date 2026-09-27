@@ -4,3 +4,5 @@ __pycache__/
 .idea/
 .venv/
 data/*.sqlite*
+data/*.log
+data/log/

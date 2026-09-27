@@ -112,6 +112,13 @@ class RefundPreviewFacts(FactsModel):
     team_update_time: StrictStr = Field(alias="teamUpdateTime")
 
 
+class RefundExecutionFacts(FactsModel):
+    status: Literal["SUCCEEDED", "FAILED", "PROCESSING"]
+    result_code: StrictStr = Field(alias="resultCode")
+    refund_executed: StrictBool = Field(alias="refundExecuted")
+    idempotent_replay: StrictBool = Field(alias="idempotentReplay")
+
+
 class RuleMatch(FactsModel):
     rule_id: StrictStr
     title: StrictStr

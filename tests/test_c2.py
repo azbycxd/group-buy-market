@@ -95,13 +95,13 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         wait_for_port(cls.fake_process, cls.fake_port)
 
         launcher = (
-            "import os; "
+            "import os,uvicorn,api; "
+            "os.environ['JAVA_BASE_URL']=''; "
             f"os.environ['FAKE_JAVA_BASE_URL']='http://127.0.0.1:{cls.fake_port}'; "
             f"os.environ['CHECKPOINT_DB_PATH']={str(cls.checkpoint_path)!r}; "
             f"os.environ['AGENT_ACTION_DB_PATH']={str(cls.action_path)!r}; "
             f"os.environ['JWT_SECRET']={cls.jwt_secret!r}; "
             f"os.environ['ACTION_CONFIRM_SECRET']={cls.confirm_secret!r}; "
-            "import uvicorn,api; "
             f"uvicorn.run(api.app,host='127.0.0.1',port={cls.api_port},"
             "log_level='info')"
         )
@@ -147,7 +147,7 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         action, created = self.store.create_or_reuse_refund_proposal(
             session_id=session_id or f"c2-{uuid.uuid4().hex}",
             user_id=user_id,
-            out_trade_no=out_trade_no or f"ORD-{uuid.uuid4().hex}",
+            out_trade_no=out_trade_no or "ORD100001",
             preview=PREVIEW,
             expected_version=EXPECTED_VERSION,
             now=now,
@@ -187,12 +187,12 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         response = self.confirm(action)
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["status"], "CONFIRMED")
-        self.assertFalse(response.json()["executed"])
+        self.assertEqual(response.json()["status"], "SUCCEEDED")
+        self.assertTrue(response.json()["executed"])
         confirmed = self.store.get_action(str(action["action_id"]))
         self.assertIsNotNone(confirmed)
-        self.assertEqual(confirmed["status"], "CONFIRMED")
-        self.assertEqual(confirmed["version"], 2)
+        self.assertEqual(confirmed["status"], "SUCCEEDED")
+        self.assertEqual(confirmed["version"], 4)
 
     def test_2_chat_confirmation_does_not_resume_action(self) -> None:
         session_id = f"chat-confirm-{uuid.uuid4().hex}"
@@ -362,7 +362,9 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
         first = self.confirm(action)
         second = self.confirm(action)
         self.assertEqual(first.status_code, 200, first.text)
-        self.assertEqual(second.status_code, 409, second.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["status"], "SUCCEEDED")
+        self.assertIn("已完成", second.json()["message"])
 
     def test_7_unexpired_proposal_is_reused(self) -> None:
         session_id = f"reuse-{uuid.uuid4().hex}"
@@ -402,16 +404,16 @@ class C2ConfirmationIntegrationTests(unittest.TestCase):
                 pool.map(lambda _: self.confirm(action), range(10))
             )
 
-        self.assertEqual(
+        self.assertGreaterEqual(
             sum(response.status_code == 200 for response in responses),
             1,
         )
         self.assertTrue(
-            all(response.status_code in {200, 409} for response in responses)
+            all(response.status_code in {200, 202} for response in responses)
         )
         confirmed = self.store.get_action(str(action["action_id"]))
-        self.assertEqual(confirmed["status"], "CONFIRMED")
-        self.assertEqual(confirmed["version"], 2)
+        self.assertEqual(confirmed["status"], "SUCCEEDED")
+        self.assertEqual(confirmed["version"], 4)
 
     def test_10_chat_remains_available_while_confirmation_waits(self) -> None:
         session_id = f"chat-available-{uuid.uuid4().hex}"

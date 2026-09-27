@@ -46,6 +46,7 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
         cls.previous_confirm_secret = os.environ.get(
             "ACTION_CONFIRM_SECRET"
         )
+        cls.previous_java_base_url = os.environ.get("JAVA_BASE_URL")
         os.environ["AGENT_ACTION_DB_PATH"] = str(cls.action_path)
         os.environ["ACTION_CONFIRM_SECRET"] = "c1-integration-confirm-secret"
         cls.fake_port = free_port()
@@ -55,6 +56,13 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
         )
 
         from agent import create_order_agent
+
+        # agent imports .env with override=True; force this regression suite
+        # back to its isolated fake service after that import.
+        os.environ["JAVA_BASE_URL"] = ""
+        os.environ["FAKE_JAVA_BASE_URL"] = (
+            f"http://127.0.0.1:{cls.fake_port}"
+        )
 
         cls.agent = create_order_agent(cls.temp_path / "checkpoints.sqlite")
 
@@ -71,6 +79,10 @@ class C1RefundProposalIntegrationTests(unittest.TestCase):
             os.environ["ACTION_CONFIRM_SECRET"] = (
                 cls.previous_confirm_secret
             )
+        if cls.previous_java_base_url is None:
+            os.environ.pop("JAVA_BASE_URL", None)
+        else:
+            os.environ["JAVA_BASE_URL"] = cls.previous_java_base_url
         cls.temporary_directory.cleanup()
 
     def invoke(self, text: str) -> dict[str, object]:

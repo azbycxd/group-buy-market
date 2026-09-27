@@ -27,7 +27,7 @@ from outcome import AgentOutcome, ClaimType
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = Path(__file__).with_name("cases.yaml")
 VALID_ACTIONS = {"ANSWER", "REQUEST_INPUT", "HANDOFF"}
-RUNS_PER_CASE = 3
+RUNS_PER_CASE = int(os.getenv("EVAL_RUNS_PER_CASE", "3"))
 
 
 @dataclass
@@ -449,6 +449,7 @@ def main() -> None:
     port = free_port()
     fake_java = start_fake_java(port)
     original_base_url = os.environ.get("FAKE_JAVA_BASE_URL")
+    original_java_base_url = os.environ.get("JAVA_BASE_URL")
     checkpoint_directory = tempfile.TemporaryDirectory(
         prefix="group-buy-agent-eval-"
     )
@@ -457,6 +458,10 @@ def main() -> None:
     try:
         from agent import close_order_agent, create_order_agent
         from tools.context import AgentContext
+
+        # agent loads .env at import time; this runner deliberately evaluates
+        # against its isolated fake service.
+        os.environ["JAVA_BASE_URL"] = ""
 
         agent = create_order_agent(
             Path(checkpoint_directory.name) / "checkpoints.sqlite"
@@ -506,6 +511,10 @@ def main() -> None:
             os.environ.pop("FAKE_JAVA_BASE_URL", None)
         else:
             os.environ["FAKE_JAVA_BASE_URL"] = original_base_url
+        if original_java_base_url is None:
+            os.environ.pop("JAVA_BASE_URL", None)
+        else:
+            os.environ["JAVA_BASE_URL"] = original_java_base_url
         fake_java.terminate()
         try:
             fake_java.wait(timeout=5)

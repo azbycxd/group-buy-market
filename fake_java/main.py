@@ -12,6 +12,7 @@ from tools.facts import (
     FactsEnvelope,
     JoinableTeamFacts,
     OrderFacts,
+    RefundExecutionFacts,
     RefundPreviewFacts,
     UserEligibilityFacts,
 )
@@ -26,6 +27,13 @@ class OrderFactsRequest(BaseModel):
 
 class ActivityFactsRequest(BaseModel):
     activityId: int
+
+
+class RefundExecuteRequest(BaseModel):
+    outTradeNo: str
+    idempotencyKey: str
+    expectedVersion: str
+    expectedRefundType: str
 
 
 UserHeader = Annotated[
@@ -127,6 +135,9 @@ REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
         "teamUpdateTime": "2026-09-27T11:07:00+08:00",
     },
 }
+
+
+REFUND_EXECUTIONS: dict[str, dict[str, Any]] = {}
 
 
 ACTIVITIES: dict[int, dict[str, Any]] = {
@@ -330,6 +341,70 @@ async def get_refund_preview(
         )
     return delayed_response(
         success(RefundPreviewFacts.model_validate(preview))
+    )
+
+
+@app.post("/api/v1/agent/order/refund")
+async def execute_refund(
+    request: RefundExecuteRequest,
+    user_id: UserHeader = None,
+) -> Any:
+    order = ORDERS.get(request.outTradeNo)
+    preview = REFUND_PREVIEWS.get(request.outTradeNo)
+    if order is None or preview is None or order["owner"] != user_id:
+        return delayed_response(
+            business_error(
+                "ORDER_NOT_FOUND_OR_NOT_AUTHORIZED",
+                "订单不存在或无权限",
+            )
+        )
+
+    previous = REFUND_EXECUTIONS.get(request.idempotencyKey)
+    if previous is not None:
+        replay = {**previous, "idempotentReplay": True}
+        return delayed_response(
+            success(RefundExecutionFacts.model_validate(replay))
+        )
+
+    expected_version = (
+        f"{preview['orderUpdateTime']}|{preview['teamUpdateTime']}"
+    )
+    if (
+        request.expectedVersion != expected_version
+        or request.expectedRefundType != preview["refundType"]
+    ):
+        result = {
+            "status": "FAILED",
+            "resultCode": "VERSION_CHANGED",
+            "refundExecuted": False,
+            "idempotentReplay": False,
+        }
+    elif request.expectedRefundType == "PAID_FORMED":
+        result = {
+            "status": "FAILED",
+            "resultCode": "MANUAL_REVIEW_REQUIRED",
+            "refundExecuted": False,
+            "idempotentReplay": False,
+        }
+    elif order["data"]["order"]["status"] == "CLOSE":
+        result = {
+            "status": "SUCCEEDED",
+            "resultCode": "ALREADY_CLOSED",
+            "refundExecuted": False,
+            "idempotentReplay": False,
+        }
+    else:
+        order["data"]["order"]["status"] = "CLOSE"
+        preview["orderStatus"] = "CLOSE"
+        result = {
+            "status": "SUCCEEDED",
+            "resultCode": "REFUND_ACCEPTED",
+            "refundExecuted": True,
+            "idempotentReplay": False,
+        }
+    REFUND_EXECUTIONS[request.idempotencyKey] = result
+    return delayed_response(
+        success(RefundExecutionFacts.model_validate(result))
     )
 
 

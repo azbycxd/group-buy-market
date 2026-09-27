@@ -8,6 +8,7 @@ import sqlite3
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,26 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_ACTION_DB_PATH = PROJECT_ROOT / "data" / "agent_actions.sqlite"
 PROPOSAL_TTL = timedelta(minutes=5)
+
+
+class ActionStatus(StrEnum):
+    PROPOSED = "PROPOSED"
+    CONFIRMED = "CONFIRMED"
+    EXECUTING = "EXECUTING"
+    UNKNOWN = "UNKNOWN"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+ALLOWED_TRANSITIONS = {
+    (ActionStatus.PROPOSED, ActionStatus.CONFIRMED),
+    (ActionStatus.CONFIRMED, ActionStatus.EXECUTING),
+    (ActionStatus.EXECUTING, ActionStatus.UNKNOWN),
+    (ActionStatus.EXECUTING, ActionStatus.SUCCEEDED),
+    (ActionStatus.EXECUTING, ActionStatus.FAILED),
+    (ActionStatus.UNKNOWN, ActionStatus.SUCCEEDED),
+    (ActionStatus.UNKNOWN, ActionStatus.FAILED),
+}
 
 
 AGENT_ACTION_SCHEMA = """
@@ -230,7 +251,7 @@ class AgentActionStore:
                         user_id,
                         "REFUND",
                         out_trade_no,
-                        "PROPOSED",
+                        ActionStatus.PROPOSED.value,
                         json.dumps(
                             preview,
                             ensure_ascii=False,
@@ -279,25 +300,76 @@ class AgentActionStore:
             cursor = connection.execute(
                 """
                 UPDATE agent_action
-                SET status = 'CONFIRMED',
+                SET status = ?,
                     version = version + 1,
                     updated_at = ?
                 WHERE action_id = ?
                   AND user_id = ?
-                  AND status = 'PROPOSED'
+                  AND status = ?
                   AND expires_at > ?
                   AND version = ?
                 """,
                 (
+                    ActionStatus.CONFIRMED.value,
                     now_text,
                     action_id,
                     user_id,
+                    ActionStatus.PROPOSED.value,
                     now_text,
                     expected_version,
                 ),
             )
             connection.commit()
             return cursor.rowcount == 1
+
+    def transition_status(
+        self,
+        *,
+        action_id: str,
+        from_status: ActionStatus,
+        to_status: ActionStatus,
+        expected_version: int,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        if (from_status, to_status) not in ALLOWED_TRANSITIONS:
+            raise ValueError(
+                f"不允许的 action 状态变化: {from_status} -> {to_status}"
+            )
+        now_text = _timestamp(now or _utc_now())
+        with closing(self._connect()) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE agent_action
+                    SET status = ?,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE action_id = ?
+                      AND status = ?
+                      AND version = ?
+                    """,
+                    (
+                        to_status.value,
+                        now_text,
+                        action_id,
+                        from_status.value,
+                        expected_version,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM agent_action WHERE action_id = ?",
+                    (action_id,),
+                ).fetchone()
+                connection.commit()
+                return dict(row) if row is not None else None
+            except Exception:
+                connection.rollback()
+                raise
 
     def list_actions(self) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:

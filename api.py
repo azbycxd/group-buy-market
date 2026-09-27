@@ -14,7 +14,7 @@ from typing import Annotated, Any, AsyncIterator
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
@@ -22,6 +22,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
 from action_ledger import (
+    ActionStatus,
     AgentActionStore,
     action_args_hash_is_current,
     confirmation_credential,
@@ -118,7 +119,7 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _validated_confirmation_action(
+def _validated_confirmation_identity(
     store: AgentActionStore,
     *,
     action_id: str,
@@ -138,19 +139,6 @@ def _validated_confirmation_action(
             "ACTION_FORBIDDEN",
             "无权确认该退款提议",
         )
-    if action.get("status") != "PROPOSED":
-        raise _confirmation_error(
-            status.HTTP_409_CONFLICT,
-            "ACTION_NOT_PROPOSED",
-            "退款提议已不处于待确认状态",
-        )
-    expires_at = _parse_timestamp(action.get("expires_at"))
-    if expires_at is None or expires_at <= datetime.now(timezone.utc):
-        raise _confirmation_error(
-            status.HTTP_410_GONE,
-            "ACTION_EXPIRED",
-            "退款提议已过期，请重新发起",
-        )
     if not action_args_hash_is_current(action):
         raise _confirmation_error(
             status.HTTP_409_CONFLICT,
@@ -168,6 +156,76 @@ def _validated_confirmation_action(
             "确认凭证无效",
         )
     return action
+
+
+def _validated_confirmation_action(
+    store: AgentActionStore,
+    *,
+    action_id: str,
+    user_id: str,
+    credential: str,
+) -> dict[str, Any]:
+    action = _validated_confirmation_identity(
+        store,
+        action_id=action_id,
+        user_id=user_id,
+        credential=credential,
+    )
+    if action.get("status") != ActionStatus.PROPOSED.value:
+        raise _confirmation_error(
+            status.HTTP_409_CONFLICT,
+            "ACTION_NOT_PROPOSED",
+            "退款提议已不处于待确认状态",
+        )
+    expires_at = _parse_timestamp(action.get("expires_at"))
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        raise _confirmation_error(
+            status.HTTP_410_GONE,
+            "ACTION_EXPIRED",
+            "退款提议已过期，请重新发起",
+        )
+    return action
+
+
+def _action_status_response(
+    action: dict[str, Any],
+    *,
+    message: str | None = None,
+) -> JSONResponse:
+    action_status = str(action["status"])
+    if action_status == ActionStatus.SUCCEEDED.value:
+        status_code = status.HTTP_200_OK
+        default_message = (
+            "退款操作已完成，订单已关闭（CLOSE）。"
+            "订单关闭不代表支付渠道资金已经到账。"
+        )
+    elif action_status in {
+        ActionStatus.CONFIRMED.value,
+        ActionStatus.EXECUTING.value,
+        ActionStatus.UNKNOWN.value,
+    }:
+        status_code = status.HTTP_202_ACCEPTED
+        default_message = (
+            "退款操作正在处理中。"
+            if action_status != ActionStatus.UNKNOWN.value
+            else "退款结果暂时无法确定，当前处于待对账状态。"
+        )
+    elif action_status == ActionStatus.FAILED.value:
+        status_code = status.HTTP_409_CONFLICT
+        default_message = "退款操作未完成，请重新发起退款提议。"
+    else:
+        status_code = status.HTTP_202_ACCEPTED
+        default_message = "退款确认正在处理中。"
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "action_id": str(action["action_id"]),
+            "status": action_status,
+            "version": int(action["version"]),
+            "executed": action_status == ActionStatus.SUCCEEDED.value,
+            "message": message or default_message,
+        },
+    )
 
 
 async def authenticated_user_id(
@@ -630,8 +688,16 @@ def create_app(
         action_id: str,
         payload: ActionConfirmRequest,
         user_id: Annotated[str, Depends(authenticated_user_id)],
-    ) -> dict[str, Any]:
-        action = _validated_confirmation_action(
+    ) -> JSONResponse:
+        action = _validated_confirmation_identity(
+            app.state.action_store,
+            action_id=action_id,
+            user_id=user_id,
+            credential=payload.credential,
+        )
+        if action.get("status") != ActionStatus.PROPOSED.value:
+            return _action_status_response(action)
+        _validated_confirmation_action(
             app.state.action_store,
             action_id=action_id,
             user_id=user_id,
@@ -641,11 +707,13 @@ def create_app(
             action_id
         )
         if action_lock is None:
-            raise _confirmation_error(
-                status.HTTP_409_CONFLICT,
-                "ACTION_CONFIRM_BUSY",
-                "退款提议正在确认中",
+            current = _validated_confirmation_identity(
+                app.state.action_store,
+                action_id=action_id,
+                user_id=user_id,
+                credential=payload.credential,
             )
+            return _action_status_response(current)
         try:
             action = _validated_confirmation_action(
                 app.state.action_store,
@@ -656,7 +724,10 @@ def create_app(
             try:
                 result = await app.state.confirmation_graph.ainvoke(
                     Command(
-                        resume={"credential_validated": True}
+                        resume={
+                            "credential_validated": True,
+                            "request_id": uuid.uuid4().hex,
+                        }
                     ),
                     config=confirmation_config(action_id),
                 )
@@ -671,25 +742,21 @@ def create_app(
                     "CONFIRMATION_WORKFLOW_UNAVAILABLE",
                     "确认工作流不可恢复，请重新发起退款提议",
                 ) from error
-            if result.get("confirmed") is not True:
+            current = app.state.action_store.get_action(action_id)
+            if current is None:
                 raise _confirmation_error(
-                    status.HTTP_409_CONFLICT,
-                    "ACTION_CONFIRM_CONFLICT",
-                    "退款提议状态或版本已变化",
+                    status.HTTP_404_NOT_FOUND,
+                    "ACTION_NOT_FOUND",
+                    "退款 action 不存在",
                 )
-            confirmed = app.state.action_store.get_action(action_id)
-            if confirmed is None or confirmed.get("status") != "CONFIRMED":
-                raise _confirmation_error(
-                    status.HTTP_409_CONFLICT,
-                    "ACTION_CONFIRM_CONFLICT",
-                    "退款提议确认未完成",
-                )
-            return {
-                "action_id": action_id,
-                "status": "CONFIRMED",
-                "version": confirmed["version"],
-                "executed": False,
-            }
+            return _action_status_response(
+                current,
+                message=(
+                    str(result["message"])
+                    if result.get("message")
+                    else None
+                ),
+            )
         finally:
             app.state.confirmation_locks.release(
                 action_id,
