@@ -14,7 +14,7 @@ flowchart LR
     R -->|缺参数 / 不支持| F[finalize]
     A --> G[GroundingGuard / RepeatGuard<br/>Tool 与 Model 调用限制]
     G --> T[5 个只读 Tool]
-    T --> J[fake Java Facts API]
+    T --> J[fake / real Java Facts API]
     T --> E[EvidenceCollector<br/>稳定 Evidence path]
     E --> R
     R --> F
@@ -93,6 +93,47 @@ SSE 生成期间会轮询 `request.is_disconnected()`。客户端断开后，服
 已经发出的下游请求仍可能完成。当前 Tool 都是只读操作，因此没有写入副作用。阶段 C
 引入写操作时，必须使用 `UNKNOWN` 状态和 reconciliation 处理这种不确定结果。
 
+### fake / real Java 切换
+
+`JAVA_BASE_URL` 为空时保持默认 fake 模式，Facts Client 使用
+`FAKE_JAVA_BASE_URL`，并发送开发头 `X-Dev-Authenticated-User-Id`。切换到真实
+Java 时配置：
+
+```powershell
+$env:JAVA_BASE_URL = "http://127.0.0.1:8091"
+$env:JAVA_INTERNAL_JWT_SECRET = "shared-secret"
+$env:JAVA_INTERNAL_JWT_ISSUER = "group-buy-agent"
+$env:JAVA_INTERNAL_JWT_AUDIENCE = "group-buy-market"
+```
+
+真实模式会为每次 Facts 请求生成 HS256 短时内部 JWT，并发送
+`Authorization: Bearer <internal JWT>`、`X-Authenticated-User-Id` 和
+`X-Request-Id`。用户身份仍只来自 HTTP 访问 JWT 已验证的 `sub`，不会进入 Tool
+参数 schema。内部 JWT、签名 secret 不写日志、不进入 Prompt、SSE 或 Tool 输出。
+
+真实模式启动顺序：
+
+1. 先启动真实 Java，并确认 Facts API 可通过 `JAVA_BASE_URL` 访问。
+2. 配置 `JAVA_INTERNAL_JWT_*`、OpenAI、HTTP `JWT_SECRET` 和可选的 LangSmith 环境变量。
+3. 启动 Agent FastAPI，使进程重新加载上述环境变量。
+4. 使用用户访问 JWT 调用 `/api/v1/chat/stream`；Agent 再以内存中生成的 internal JWT 调用 Java。
+
+每个 `/api/v1/chat/stream` 请求生成独立 `request_id`。该值写入 LangGraph run
+metadata，传给 Tool/Java 请求和结构化日志，并包含在 SSE `final` / `timeout`
+事件中。Java 调用日志只记录 path、latency、response code、request_id 和模式。
+
+启用 LangSmith trace：
+
+```powershell
+$env:LANGSMITH_TRACING = "true"
+$env:LANGSMITH_API_KEY = "your-langsmith-api-key"
+$env:LANGSMITH_PROJECT = "group-buy-agent"
+```
+
+一次请求的 trace 以 `group-buy-agent-request` 为根运行，包含 StateGraph 的
+`understand`、`agent`、`finalize` 节点，以及模型、Tool 和 `outcome` 子运行；
+`request_id` 可用于关联 Agent trace、服务日志和 Java 请求日志。
+
 需要跨进程继续同一会话时，复用同一个 `session_id`：
 
 ```powershell
@@ -133,12 +174,12 @@ python -m unittest tests.test_b3_session_lock -v
 | --- | ---: |
 | Case 总数 | 63 |
 | 正式 Case | 63 |
-| 单次通过 | 174 / 189（92.06%） |
-| 单次通过率 Wilson 95% CI | 87.32%–95.13% |
+| 单次通过 | 176 / 189（93.12%） |
+| 单次通过率 Wilson 95% CI | 88.59%–95.94% |
 | 3 次全过 | 56 / 63（88.89%） |
 | 3 次全过率 Wilson 95% CI | 78.80%–94.51% |
-| 平均 token | 3210.14 |
-| 平均延迟 | 3.518 秒 |
+| 平均 token | 3244.08 |
+| 平均延迟 | 3.319 秒 |
 
 Case 分类：参团诊断 12、订单 10、可加入团队 8、规则问答 10、能力不支持 8、参数 / 注入 6、多轮补参数 6、多轮状态隔离 3。6 条多轮补参数和 3 条多轮状态隔离 Case 本次均为 3/3 PASS。
 

@@ -17,5 +17,6 @@ def get_user_eligibility_facts(
         path="/api/v1/agent/activity/eligibility-facts",
         body={"activityId": arguments.activityId},
         user_id=runtime.context.user_id,
+        request_id=runtime.context.request_id,
         data_model=UserEligibilityFacts,
     )

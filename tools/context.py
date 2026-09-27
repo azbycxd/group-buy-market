@@ -7,3 +7,4 @@ class AgentContext:
     user_id: str
     parsed_entities: tuple[Any, ...] = ()
     user_text: str = ""
+    request_id: str = ""

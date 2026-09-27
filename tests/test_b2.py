@@ -190,6 +190,7 @@ class B2IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(events[-1]["event"], "final")
         self.assertEqual(events[-1]["data"]["kind"], "ANSWER")
+        self.assertEqual(len(events[-1]["data"]["request_id"]), 32)
         self.assertLess(events[0]["elapsed"], events[-1]["elapsed"])
         self.assertLess(events[0]["elapsed"], 2)
         self.assertGreater(elapsed, events[0]["elapsed"])
@@ -262,6 +263,7 @@ class B2IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(events[-1]["event"], "timeout")
         self.assertEqual(events[-1]["data"]["kind"], "HANDOFF")
+        self.assertEqual(len(events[-1]["data"]["request_id"]), 32)
         self.assertGreaterEqual(elapsed, 24)
         self.assertLess(elapsed, 28)
 

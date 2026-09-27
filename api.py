@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from threading import Lock
@@ -163,18 +164,24 @@ async def _run_agent(
     payload: ChatStreamRequest,
     queue: asyncio.Queue[dict[str, str]],
     user_id: str,
+    request_id: str,
 ) -> AgentOutcome:
     loop = asyncio.get_running_loop()
     callback = ToolProgressCallback(loop, queue)
     config = {
         "callbacks": [callback],
         "configurable": {"thread_id": payload.session_id},
+        "metadata": {
+            "request_id": request_id,
+            "session_id": payload.session_id,
+        },
+        "run_name": "group-buy-agent-request",
     }
     outcome: AgentOutcome | None = None
 
     async for update in agent.astream(
         {"messages": [HumanMessage(content=payload.message)]},
-        context=AgentContext(user_id=user_id),
+        context=AgentContext(user_id=user_id, request_id=request_id),
         config=config,
         stream_mode="updates",
     ):
@@ -194,19 +201,31 @@ async def _run_agent(
     return outcome
 
 
-def _record_execution(app: FastAPI, session_id: str, event: str) -> None:
+def _record_execution(
+    app: FastAPI,
+    session_id: str,
+    request_id: str,
+    event: str,
+) -> None:
     record = {
         "session_id": session_id,
+        "request_id": request_id,
         "event": event,
         "time": time.time(),
     }
     app.state.execution_events.append(record)
-    logger.info("%s session_id=%s", event, session_id)
+    logger.info(
+        "%s session_id=%s request_id=%s",
+        event,
+        session_id,
+        request_id,
+    )
 
 
 async def _cancel_task(
     app: FastAPI,
     session_id: str,
+    request_id: str,
     task: asyncio.Task[AgentOutcome],
 ) -> None:
     if task.done():
@@ -214,7 +233,7 @@ async def _cancel_task(
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
-    _record_execution(app, session_id, "cancelled")
+    _record_execution(app, session_id, request_id, "cancelled")
 
 
 def create_app(
@@ -260,6 +279,7 @@ def create_app(
         request: Request,
         user_id: Annotated[str, Depends(authenticated_user_id)],
     ) -> StreamingResponse:
+        request_id = uuid.uuid4().hex
         if not await app.state.session_ownership.claim(
             payload.session_id,
             user_id,
@@ -287,8 +307,20 @@ def create_app(
             disconnected_recorded = False
 
             try:
+                _record_execution(
+                    app,
+                    payload.session_id,
+                    request_id,
+                    "request_started",
+                )
                 execution = asyncio.create_task(
-                    _run_agent(app.state.agent, payload, queue, user_id)
+                    _run_agent(
+                        app.state.agent,
+                        payload,
+                        queue,
+                        user_id,
+                        request_id,
+                    )
                 )
                 yield _sse(
                     "progress",
@@ -303,17 +335,33 @@ def create_app(
                         _record_execution(
                             app,
                             payload.session_id,
+                            request_id,
                             "client_disconnected",
                         )
                         disconnected_recorded = True
-                        await _cancel_task(app, payload.session_id, execution)
+                        await _cancel_task(
+                            app,
+                            payload.session_id,
+                            request_id,
+                            execution,
+                        )
                         return
 
                     elapsed = asyncio.get_running_loop().time() - started_at
                     remaining = app.state.request_timeout_seconds - elapsed
                     if remaining <= 0:
-                        await _cancel_task(app, payload.session_id, execution)
-                        _record_execution(app, payload.session_id, "timeout")
+                        await _cancel_task(
+                            app,
+                            payload.session_id,
+                            request_id,
+                            execution,
+                        )
+                        _record_execution(
+                            app,
+                            payload.session_id,
+                            request_id,
+                            "timeout",
+                        )
                         yield _sse(
                             "timeout",
                             {
@@ -321,6 +369,7 @@ def create_app(
                                 "answer": (
                                     "本次处理超时，请稍后重试或联系人工客服。"
                                 ),
+                                "request_id": request_id,
                             },
                         )
                         return
@@ -333,11 +382,18 @@ def create_app(
                         outcome = execution.result()
                         while not queue.empty():
                             yield _sse("progress", queue.get_nowait())
+                        _record_execution(
+                            app,
+                            payload.session_id,
+                            request_id,
+                            "request_completed",
+                        )
                         yield _sse(
                             "final",
                             {
                                 "kind": outcome.kind.value,
                                 "answer": outcome.final_answer,
+                                "request_id": request_id,
                             },
                         )
                         return
@@ -355,10 +411,16 @@ def create_app(
                     _record_execution(
                         app,
                         payload.session_id,
+                        request_id,
                         "client_disconnected",
                     )
                 if execution is not None:
-                    await _cancel_task(app, payload.session_id, execution)
+                    await _cancel_task(
+                        app,
+                        payload.session_id,
+                        request_id,
+                        execution,
+                    )
                 raise
             except Exception:
                 logger.exception(
@@ -366,17 +428,28 @@ def create_app(
                     payload.session_id,
                 )
                 if execution is not None:
-                    await _cancel_task(app, payload.session_id, execution)
+                    await _cancel_task(
+                        app,
+                        payload.session_id,
+                        request_id,
+                        execution,
+                    )
                 yield _sse(
                     "final",
                     {
                         "kind": OutcomeKind.HANDOFF.value,
                         "answer": "本次处理失败，已转人工客服核实。",
+                        "request_id": request_id,
                     },
                 )
             finally:
                 if execution is not None and not execution.done():
-                    await _cancel_task(app, payload.session_id, execution)
+                    await _cancel_task(
+                        app,
+                        payload.session_id,
+                        request_id,
+                        execution,
+                    )
                 app.state.session_locks.release(
                     payload.session_id,
                     session_lock,

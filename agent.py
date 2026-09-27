@@ -387,6 +387,7 @@ def _compile_order_agent(checkpointer: object):
                 user_id=runtime.context.user_id,
                 parsed_entities=tuple(state.get("parsed_entities", [])),
                 user_text=_latest_user_text(state["messages"]),
+                request_id=runtime.context.request_id,
             ),
         )
         return {
@@ -412,7 +413,8 @@ def _compile_order_agent(checkpointer: object):
                         ensure_ascii=False,
                     )
                 ),
-            ]
+            ],
+            config={"run_name": "outcome"},
         )
         return _validated_answer_outcome(generated, evidence)
 

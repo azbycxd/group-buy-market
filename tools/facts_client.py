@@ -1,7 +1,11 @@
+import logging
 import os
+import time
+import uuid
 from typing import Any
 
 import httpx
+import jwt
 from pydantic import BaseModel, ValidationError
 
 from tools.facts import FactsEnvelope, ToolResult
@@ -9,6 +13,9 @@ from tools.facts import FactsEnvelope, ToolResult
 
 FACTS_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
 FACTS_HTTP_CLIENT = httpx.Client(timeout=FACTS_TIMEOUT, trust_env=False)
+INTERNAL_JWT_ALGORITHM = "HS256"
+INTERNAL_JWT_TTL_SECONDS = 60
+logger = logging.getLogger("group_buy_agent.facts_client")
 
 BUSINESS_RESULT_CODES = {
     "AUTH_REQUIRED",
@@ -55,22 +62,130 @@ def _invalid_response() -> dict[str, Any]:
     )
 
 
+def _required_environment(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"missing required environment: {name}")
+    return value
+
+
+def _internal_service_jwt() -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "iss": _required_environment("JAVA_INTERNAL_JWT_ISSUER"),
+            "aud": _required_environment("JAVA_INTERNAL_JWT_AUDIENCE"),
+            "iat": now,
+            "exp": now + INTERNAL_JWT_TTL_SECONDS,
+        },
+        _required_environment("JAVA_INTERNAL_JWT_SECRET"),
+        algorithm=INTERNAL_JWT_ALGORITHM,
+    )
+
+
+def _request_target(
+    *,
+    user_id: str,
+    request_id: str,
+) -> tuple[str, dict[str, str], str]:
+    real_base_url = os.getenv("JAVA_BASE_URL", "").strip()
+    if real_base_url:
+        return (
+            real_base_url,
+            {
+                "Authorization": f"Bearer {_internal_service_jwt()}",
+                "X-Authenticated-User-Id": user_id,
+                "X-Request-Id": request_id,
+            },
+            "real",
+        )
+    return (
+        os.getenv("FAKE_JAVA_BASE_URL", "http://127.0.0.1:8000"),
+        {
+            "X-Dev-Authenticated-User-Id": user_id,
+            "X-Request-Id": request_id,
+        },
+        "fake",
+    )
+
+
+def _log_request(
+    *,
+    path: str,
+    started_at: float,
+    response_code: str | int,
+    request_id: str,
+    mode: str,
+) -> None:
+    logger.info(
+        "facts_request path=%s latency_ms=%.1f response_code=%s "
+        "request_id=%s mode=%s",
+        path,
+        (time.perf_counter() - started_at) * 1000,
+        response_code,
+        request_id,
+        mode,
+    )
+
+
 def query_facts(
     *,
     path: str,
     body: dict[str, object],
     user_id: str,
+    request_id: str = "",
     data_model: type[BaseModel],
 ) -> dict[str, Any]:
-    base_url = os.getenv("FAKE_JAVA_BASE_URL", "http://127.0.0.1:8000")
+    effective_request_id = request_id or f"tool-{uuid.uuid4().hex}"
+    started_at = time.perf_counter()
+    mode = "real" if os.getenv("JAVA_BASE_URL", "").strip() else "fake"
+    try:
+        base_url, headers, mode = _request_target(
+            user_id=user_id,
+            request_id=effective_request_id,
+        )
+    except RuntimeError:
+        _log_request(
+            path=path,
+            started_at=started_at,
+            response_code="CONFIG_ERROR",
+            request_id=effective_request_id,
+            mode=mode,
+        )
+        return _service_unavailable()
+
     try:
         response = FACTS_HTTP_CLIENT.post(
             f"{base_url.rstrip('/')}{path}",
             json=body,
-            headers={"X-Dev-Authenticated-User-Id": user_id},
+            headers=headers,
         )
-    except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError):
+    except httpx.TimeoutException:
+        _log_request(
+            path=path,
+            started_at=started_at,
+            response_code="TIMEOUT",
+            request_id=effective_request_id,
+            mode=mode,
+        )
         return _service_unavailable()
+    except (httpx.ConnectError, httpx.RequestError):
+        _log_request(
+            path=path,
+            started_at=started_at,
+            response_code="CONNECTION_ERROR",
+            request_id=effective_request_id,
+            mode=mode,
+        )
+        return _service_unavailable()
+
+    _log_request(
+        path=path,
+        started_at=started_at,
+        response_code=response.status_code,
+        request_id=effective_request_id,
+        mode=mode,
+    )
 
     if response.status_code >= 500:
         return _service_unavailable()

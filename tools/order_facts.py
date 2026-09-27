@@ -17,5 +17,6 @@ def get_order_facts(
         path="/api/v1/agent/order/facts",
         body={"outTradeNo": arguments.outTradeNo},
         user_id=runtime.context.user_id,
+        request_id=runtime.context.request_id,
         data_model=OrderFacts,
     )

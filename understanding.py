@@ -88,9 +88,45 @@ _ORDER_NUMBER = re.compile(
     r"(?<![A-Za-z0-9._-])(ORD[A-Za-z0-9._-]*)(?![A-Za-z0-9._-])",
     re.IGNORECASE,
 )
+_NUMERIC_ORDER_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9._-])([0-9]{6,128})(?![A-Za-z0-9._-])"
+)
+_LABELED_NUMERIC_ORDER = re.compile(
+    r"(?:订单(?:号)?|outTradeNo)\s*(?:是|为|=|:|：)?\s*"
+    r"([0-9]{6,128})(?![A-Za-z0-9._-])",
+    re.IGNORECASE,
+)
+_BARE_PENDING_NUMERIC_ORDER = re.compile(
+    r"\s*([0-9]{6,128})\s*[。.!！?？]?\s*"
+)
 _ACTIVITY_ID = re.compile(
     r"(?<![A-Za-z0-9._-])(?:活动\s*)?([0-9]+)(?![A-Za-z0-9._-])"
 )
+
+
+def _resolve_order_match(
+    source_text: str,
+    user_text: str,
+    *,
+    pending: bool = False,
+) -> re.Match[str] | None:
+    prefixed = _ORDER_NUMBER.search(source_text)
+    if prefixed is not None:
+        return prefixed
+
+    numeric = _NUMERIC_ORDER_NUMBER.search(source_text)
+    if numeric is None:
+        return None
+    if pending and _BARE_PENDING_NUMERIC_ORDER.fullmatch(user_text):
+        return numeric
+    return next(
+        (
+            match
+            for match in _LABELED_NUMERIC_ORDER.finditer(user_text)
+            if match.group(1) == numeric.group(1)
+        ),
+        None,
+    )
 
 
 def resolve_entities(
@@ -108,7 +144,7 @@ def resolve_entities(
 
         try:
             if mention.entity_type is EntityType.ORDER:
-                match = _ORDER_NUMBER.search(source_text)
+                match = _resolve_order_match(source_text, user_text)
                 if match is None:
                     continue
                 value = OrderFactsArguments.model_validate(
@@ -152,7 +188,11 @@ def resolve_pending_entities(
     for entity_type in dict.fromkeys(missing_entities):
         try:
             if entity_type is EntityType.ORDER:
-                match = _ORDER_NUMBER.search(user_text)
+                match = _resolve_order_match(
+                    user_text,
+                    user_text,
+                    pending=True,
+                )
                 if match is None:
                     continue
                 value = OrderFactsArguments.model_validate(
