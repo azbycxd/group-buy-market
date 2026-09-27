@@ -45,6 +45,38 @@ python -m uvicorn fake_java.main:app --host 127.0.0.1 --port 8000
 python cli.py "订单 ORD100001 现在什么状态"
 ```
 
+启动只提供 SSE 的 FastAPI 接口：
+
+```powershell
+python -m uvicorn api:app --host 127.0.0.1 --port 8080
+```
+
+使用 `curl -N` 关闭客户端响应缓冲，可以立即看到执行进度：
+
+```powershell
+curl.exe -N -H "Content-Type: application/json" `
+  -d '{"session_id":"demo-session","message":"活动 100123 还有效吗"}' `
+  http://127.0.0.1:8080/api/v1/chat/stream
+```
+
+`POST /api/v1/chat/stream` 接收 `session_id` 和 `message`。`session_id`
+直接作为 LangGraph `thread_id`，因此 HTTP 请求之间继续使用 SQLite checkpoint
+恢复会话。接口只返回 `text/event-stream`：
+
+- `progress`：当前处于 `understanding` 或 `tool` 阶段；Tool 事件包含 Tool 名称。
+- `final`：包含结构化 `kind`（`ANSWER`、`REQUEST_INPUT` 或 `HANDOFF`）和回答。
+- `timeout`：完整请求超过总时限时返回 `HANDOFF`，随后关闭 SSE。
+
+Facts HTTP Client 的 5 秒 timeout 约束一次下游 HTTP 操作；Agent 请求总 timeout
+默认是 25 秒，覆盖理解、模型调用、Tool、重试和最终结构化输出的完整过程，可通过
+`AGENT_REQUEST_TIMEOUT_SECONDS` 调整。测试用 fake Java 可设置
+`FAKE_JAVA_DELAY_SECONDS=30`；默认值为 0，不影响正常运行和 Eval。延迟模式会维持
+测试连接但推迟完整 JSON 响应，以便独立验证请求级总时限。
+
+SSE 生成期间会轮询 `request.is_disconnected()`。客户端断开后，服务端停止生成事件、
+取消当前 Agent task，并记录 `client_disconnected` 和 `cancelled`。这属于尽力取消，
+已经在线程中执行的同步底层调用可能仍需自行结束。
+
 需要跨进程继续同一会话时，复用同一个 `session_id`：
 
 ```powershell
@@ -61,6 +93,13 @@ python cli.py --session-id b1-demo "100123"
 python -m evals.run
 ```
 
+运行 B2 的真实 HTTP 集成测试：
+
+```powershell
+$env:RUN_B2_INTEGRATION = "1"
+python -m unittest tests.test_b2 -v
+```
+
 ## 当前评测结果
 
 评测日期：2026-09-27。使用环境变量配置的真实 DeepSeek 模型，每条 Case 运行 3 次；每次使用独立 `session_id`，同一多轮 Case 的各轮复用该 `session_id`。
@@ -69,12 +108,12 @@ python -m evals.run
 | --- | ---: |
 | Case 总数 | 63 |
 | 正式 Case | 63 |
-| 单次通过 | 171 / 189（90.48%） |
-| 单次通过率 Wilson 95% CI | 85.45%–93.89% |
-| 3 次全过 | 54 / 63（85.71%） |
-| 3 次全过率 Wilson 95% CI | 75.03%–92.30% |
-| 平均 token | 3141.24 |
-| 平均延迟 | 3.504 秒 |
+| 单次通过 | 177 / 189（93.65%） |
+| 单次通过率 Wilson 95% CI | 89.23%–96.33% |
+| 3 次全过 | 58 / 63（92.06%） |
+| 3 次全过率 Wilson 95% CI | 82.73%–96.56% |
+| 平均 token | 3226.41 |
+| 平均延迟 | 3.546 秒 |
 
 Case 分类：参团诊断 12、订单 10、可加入团队 8、规则问答 10、能力不支持 8、参数 / 注入 6、多轮补参数 6、多轮状态隔离 3。6 条多轮补参数和 3 条多轮状态隔离 Case 本次均为 3/3 PASS。
 

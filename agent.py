@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+import aiosqlite
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.messages import (
@@ -17,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
@@ -268,34 +270,26 @@ def _merge_entities(
     return list(merged.values())
 
 
-def create_order_agent(
-    checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
-):
-    checkpoint_file = Path(checkpoint_path).resolve()
-    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_connection = sqlite3.connect(
-        checkpoint_file,
-        check_same_thread=False,
+def _checkpoint_serde() -> JsonPlusSerializer:
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=[
+            InformationNeed,
+            EntityType,
+            ParsedEntity,
+            Understanding,
+            RequirementStatus,
+            Evidence,
+            EvidenceSignal,
+            EvidenceType,
+            AgentOutcome,
+            OutcomeKind,
+            Claim,
+            ClaimType,
+        ]
     )
-    checkpointer = SqliteSaver(
-        checkpoint_connection,
-        serde=JsonPlusSerializer(
-            allowed_msgpack_modules=[
-                InformationNeed,
-                EntityType,
-                ParsedEntity,
-                Understanding,
-                RequirementStatus,
-                Evidence,
-                EvidenceSignal,
-                EvidenceType,
-                AgentOutcome,
-                OutcomeKind,
-                Claim,
-                ClaimType,
-            ]
-        ),
-    )
+
+
+def _compile_order_agent(checkpointer: object):
     model = _create_model()
     understander = create_understander(model)
     outcome_generator = model.with_structured_output(
@@ -519,8 +513,52 @@ def create_order_agent(
     return graph.compile(checkpointer=checkpointer)
 
 
+def create_order_agent(
+    checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
+):
+    checkpoint_file = Path(checkpoint_path).resolve()
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_connection = sqlite3.connect(
+        checkpoint_file,
+        check_same_thread=False,
+    )
+    checkpointer = SqliteSaver(
+        checkpoint_connection,
+        serde=_checkpoint_serde(),
+    )
+    try:
+        return _compile_order_agent(checkpointer)
+    except Exception:
+        checkpoint_connection.close()
+        raise
+
+
+async def create_async_order_agent(
+    checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
+):
+    checkpoint_file = Path(checkpoint_path).resolve()
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_connection = await aiosqlite.connect(checkpoint_file)
+    checkpointer = AsyncSqliteSaver(
+        checkpoint_connection,
+        serde=_checkpoint_serde(),
+    )
+    try:
+        return _compile_order_agent(checkpointer)
+    except Exception:
+        await checkpoint_connection.close()
+        raise
+
+
 def close_order_agent(agent: object) -> None:
     checkpointer = getattr(agent, "checkpointer", None)
     connection = getattr(checkpointer, "conn", None)
     if connection is not None:
         connection.close()
+
+
+async def close_async_order_agent(agent: object) -> None:
+    checkpointer = getattr(agent, "checkpointer", None)
+    connection = getattr(checkpointer, "conn", None)
+    if connection is not None:
+        await connection.close()

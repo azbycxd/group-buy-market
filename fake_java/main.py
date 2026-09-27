@@ -1,6 +1,10 @@
+import asyncio
+import json
+import os
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from tools.facts import (
@@ -203,42 +207,73 @@ def auth_error(user_id: str | None) -> dict[str, Any] | None:
     return None
 
 
+def configured_delay_seconds() -> float:
+    try:
+        delay = float(os.getenv("FAKE_JAVA_DELAY_SECONDS", "0"))
+    except ValueError:
+        delay = 0
+    return max(delay, 0)
+
+
+def delayed_response(payload: dict[str, Any]) -> dict[str, Any] | StreamingResponse:
+    delay = configured_delay_seconds()
+    if delay == 0:
+        return payload
+
+    async def body() -> Any:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            # Keep the test connection active so the request-level timeout,
+            # rather than httpx's per-read timeout, is what ends the request.
+            yield b" "
+            await asyncio.sleep(min(1.0, remaining))
+        yield json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    return StreamingResponse(body(), media_type="application/json")
+
+
 @app.post("/api/v1/agent/order/facts")
-def get_order_facts(
+async def get_order_facts(
     request: OrderFactsRequest,
     user_id: UserHeader = None,
-) -> dict[str, Any]:
+) -> Any:
     order = ORDERS.get(request.outTradeNo)
     if order is None or order["owner"] != user_id:
-        return business_error(
-            "ORDER_NOT_FOUND_OR_NOT_AUTHORIZED",
-            "订单不存在或无权限",
+        return delayed_response(
+            business_error(
+                "ORDER_NOT_FOUND_OR_NOT_AUTHORIZED",
+                "订单不存在或无权限",
+            )
         )
-    return success(OrderFacts.model_validate(order["data"]))
+    return delayed_response(success(OrderFacts.model_validate(order["data"])))
 
 
 @app.post("/api/v1/agent/activity/facts")
-def get_activity_facts(
+async def get_activity_facts(
     request: ActivityFactsRequest,
     user_id: UserHeader = None,
-) -> dict[str, Any]:
+) -> Any:
     if error := auth_error(user_id):
-        return error
+        return delayed_response(error)
     data = ACTIVITIES.get(request.activityId)
     if data is None:
-        return business_error("ACTIVITY_NOT_FOUND", "活动不存在")
-    return success(ActivityFacts.model_validate(data))
+        return delayed_response(business_error("ACTIVITY_NOT_FOUND", "活动不存在"))
+    return delayed_response(success(ActivityFacts.model_validate(data)))
 
 
 @app.post("/api/v1/agent/activity/eligibility-facts")
-def get_user_eligibility_facts(
+async def get_user_eligibility_facts(
     request: ActivityFactsRequest,
     user_id: UserHeader = None,
-) -> dict[str, Any]:
+) -> Any:
     if error := auth_error(user_id):
-        return error
+        return delayed_response(error)
     if request.activityId not in ACTIVITIES:
-        return business_error("ACTIVITY_NOT_FOUND", "活动不存在")
+        return delayed_response(business_error("ACTIVITY_NOT_FOUND", "活动不存在"))
     data = ELIGIBILITY.get((user_id, request.activityId))
     if data is None:
         data = {
@@ -254,17 +289,17 @@ def get_user_eligibility_facts(
             "marketDowngraded": False,
             "userWithinReleaseRange": True,
         }
-    return success(UserEligibilityFacts.model_validate(data))
+    return delayed_response(success(UserEligibilityFacts.model_validate(data)))
 
 
 @app.post("/api/v1/agent/team/joinable-facts")
-def get_joinable_team_facts(
+async def get_joinable_team_facts(
     request: ActivityFactsRequest,
     user_id: UserHeader = None,
-) -> dict[str, Any]:
+) -> Any:
     if error := auth_error(user_id):
-        return error
+        return delayed_response(error)
     data = JOINABLE_TEAMS.get(request.activityId)
     if data is None:
-        return business_error("ACTIVITY_NOT_FOUND", "活动不存在")
-    return success(JoinableTeamFacts.model_validate(data))
+        return delayed_response(business_error("ACTIVITY_NOT_FOUND", "活动不存在"))
+    return delayed_response(success(JoinableTeamFacts.model_validate(data)))
