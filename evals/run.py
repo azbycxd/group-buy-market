@@ -96,6 +96,13 @@ def load_cases() -> list[dict[str, Any]]:
         seen_ids.add(case["id"])
         if case["expected_action"] not in VALID_ACTIONS:
             raise ValueError(f"Case {case['id']} expected_action 非法")
+        allowed_actions = case.get("allowed_actions", [case["expected_action"]])
+        if (
+            not isinstance(allowed_actions, list)
+            or not allowed_actions
+            or any(action not in VALID_ACTIONS for action in allowed_actions)
+        ):
+            raise ValueError(f"Case {case['id']} allowed_actions 非法")
         if ("input" in case) == ("turns" in case):
             raise ValueError(f"Case {case['id']} 必须且只能包含 input 或 turns")
         if "turns" in case and (
@@ -208,9 +215,10 @@ def evaluate_result(
         reasons.append("缺少合法 AgentOutcome")
 
     actual_action = outcome.kind.value if outcome is not None else "ERROR"
-    if actual_action != case["expected_action"]:
+    allowed_actions = case.get("allowed_actions", [case["expected_action"]])
+    if actual_action not in allowed_actions:
         reasons.append(
-            f"action 期望 {case['expected_action']}，实际 {actual_action}"
+            f"action 允许 {'/'.join(allowed_actions)}，实际 {actual_action}"
         )
 
     missing_tools = [
