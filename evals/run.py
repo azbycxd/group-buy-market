@@ -13,6 +13,8 @@ from typing import Any
 import yaml
 from langchain_core.messages import AIMessage
 
+from outcome import AgentOutcome
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = Path(__file__).with_name("cases.yaml")
@@ -138,7 +140,12 @@ def evaluate_case(agent: Any, context_type: Any, case: dict[str, Any]) -> EvalRe
             if not message.tool_calls and message.content:
                 final_answer = message_text(message.content)
 
-    actual_action = infer_action(final_answer, tool_calls)
+    outcome = result.get("outcome")
+    if isinstance(outcome, AgentOutcome):
+        actual_action = outcome.kind.value
+        final_answer = outcome.final_answer
+    else:
+        actual_action = infer_action(final_answer, tool_calls)
     reasons: list[str] = []
     if actual_action != case["expected_action"]:
         reasons.append(

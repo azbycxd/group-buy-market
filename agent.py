@@ -1,15 +1,24 @@
+import json
 import os
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain_core.messages import AnyMessage, AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AnyMessage,
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.runtime import Runtime
 
 from agent_middleware import create_agent_middleware
+from evidence import Evidence, EvidenceType, merge_evidence
+from outcome import AgentOutcome, Claim, ClaimType, OutcomeKind
 from requirement_tracker import (
     CAPABILITY_TABLE,
     RequirementDecision,
@@ -51,6 +60,16 @@ SYSTEM_PROMPT = (
     "业务服务暂时不可用时必须如实说明“暂时无法查询”，禁止猜测业务状态。"
 )
 
+OUTCOME_PROMPT = """你是最终回答结构化节点。根据草稿回答和 Evidence 清单生成 AgentOutcome。
+- kind 必须是 ANSWER。
+- 将草稿中的业务事实或规则结论写入 claims。
+- FACT Claim 只能逐字引用清单中 type=FACT 的 path。
+- RULE Claim 只能逐字引用清单中 type=RULE 的 path。
+- CAPABILITY Claim 用于能力边界或服务可用性，可以不引用 Evidence。
+- 不得创造、改写或猜测 Evidence path。
+- final_answer 使用中文简洁回答用户问题。
+"""
+
 
 TOOL_ORDER = (
     get_order_facts,
@@ -68,6 +87,8 @@ class AgentState(TypedDict, total=False):
     requirement_status: RequirementStatus
     missing_evidence: list[str]
     agent_rounds: int
+    evidence: Annotated[list[Evidence], merge_evidence]
+    outcome: AgentOutcome
 
 
 def _create_model() -> ChatOpenAI:
@@ -87,21 +108,132 @@ def _latest_user_text(messages: list[AnyMessage]) -> str:
 
 def _select_tools(needs: list[InformationNeed]) -> list[object]:
     selected_names = {
-        evidence_name
+        evidence_name.split(".", 1)[0]
         for need in needs
         for evidence_name in CAPABILITY_TABLE[need].required_evidence
     }
     return [tool for tool in TOOL_ORDER if tool.name in selected_names]
 
 
-def _called_tool_evidence(messages: list[AnyMessage]) -> list[str]:
-    """S5 temporary scaffold: infer evidence from tool calls; delete in S7."""
-    return [
-        call["name"]
-        for message in messages
-        if isinstance(message, AIMessage)
-        for call in message.tool_calls
+def _latest_draft_answer(messages: list[AnyMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and not message.tool_calls and message.content:
+            if isinstance(message.content, str):
+                return message.content
+            return json.dumps(message.content, ensure_ascii=False)
+    return ""
+
+
+def _has_tool_code(messages: list[AnyMessage], code: str) -> bool:
+    for message in messages:
+        if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+            continue
+        try:
+            payload = json.loads(message.content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("code") == code:
+            return True
+    return False
+
+
+def _has_empty_rule_search(messages: list[AnyMessage]) -> bool:
+    for message in messages:
+        if (
+            not isinstance(message, ToolMessage)
+            or message.name != "search_group_buy_rules"
+            or not isinstance(message.content, str)
+        ):
+            continue
+        try:
+            payload = json.loads(message.content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("success") is True
+            and isinstance(payload.get("data"), dict)
+            and payload["data"].get("matches") == []
+        ):
+            return True
+    return False
+
+
+def _capability_outcome(kind: OutcomeKind, text: str) -> AgentOutcome:
+    return AgentOutcome(
+        kind=kind,
+        claims=[Claim(text=text, type=ClaimType.CAPABILITY, evidence=[])],
+        final_answer=text,
+    )
+
+
+def _claim_errors(outcome: AgentOutcome, evidence: list[Evidence]) -> list[str]:
+    catalog = {item.path: item.type for item in evidence}
+    errors: list[str] = []
+    for claim in outcome.claims:
+        missing_paths = [path for path in claim.evidence if path not in catalog]
+        if missing_paths:
+            errors.append(f"不存在的 Evidence: {', '.join(missing_paths)}")
+
+        if claim.type in {ClaimType.FACT, ClaimType.RULE}:
+            if not claim.evidence:
+                errors.append(f"{claim.type.value} Claim 缺少 Evidence")
+                continue
+            expected_type = (
+                EvidenceType.FACT
+                if claim.type is ClaimType.FACT
+                else EvidenceType.RULE
+            )
+            wrong_type = [
+                path
+                for path in claim.evidence
+                if path in catalog and catalog[path] is not expected_type
+            ]
+            if wrong_type:
+                errors.append(
+                    f"{claim.type.value} Claim 引用了错误类型 Evidence: "
+                    f"{', '.join(wrong_type)}"
+                )
+    return errors
+
+
+def _evidence_backed_outcome(
+    draft_answer: str,
+    evidence: list[Evidence],
+) -> AgentOutcome:
+    claims: list[Claim] = []
+    fact_paths = [
+        item.path for item in evidence if item.type is EvidenceType.FACT
     ]
+    rule_paths = [
+        item.path for item in evidence if item.type is EvidenceType.RULE
+    ]
+    if fact_paths:
+        claims.append(
+            Claim(
+                text=draft_answer,
+                type=ClaimType.FACT,
+                evidence=fact_paths,
+            )
+        )
+    if rule_paths:
+        claims.append(
+            Claim(
+                text=draft_answer,
+                type=ClaimType.RULE,
+                evidence=rule_paths,
+            )
+        )
+    if not claims:
+        return _capability_outcome(
+            OutcomeKind.HANDOFF,
+            "最终结论缺少可验证证据，请联系人工客服处理。",
+        )
+    return AgentOutcome(
+        kind=OutcomeKind.ANSWER,
+        claims=claims,
+        final_answer=draft_answer,
+    )
 
 
 def _request_input(decision: RequirementDecision) -> str:
@@ -129,6 +261,11 @@ def _entity_context(entities: list[ParsedEntity]) -> str:
 def create_order_agent():
     model = _create_model()
     understander = create_understander(model)
+    outcome_generator = model.with_structured_output(
+        AgentOutcome,
+        method="function_calling",
+        strict=True,
+    )
     tracker = RequirementTracker()
     agents: dict[tuple[str, ...], object] = {}
 
@@ -151,7 +288,7 @@ def create_order_agent():
         decision = tracker.evaluate(
             needs=needs,
             entities=state.get("parsed_entities", []),
-            evidence=_called_tool_evidence(state["messages"]),
+            evidence=state.get("evidence", []),
         )
         if decision.status in {
             RequirementStatus.UNSUPPORTED,
@@ -187,19 +324,46 @@ def create_order_agent():
         return {
             "messages": result["messages"][len(inner_messages):],
             "agent_rounds": state.get("agent_rounds", 0) + 1,
+            "evidence": result.get("evidence", []),
         }
+
+    def answer_outcome(state: AgentState) -> AgentOutcome:
+        evidence = state.get("evidence", [])
+        draft_answer = _latest_draft_answer(state["messages"])
+        generated = outcome_generator.invoke(
+            [
+                SystemMessage(content=OUTCOME_PROMPT),
+                HumanMessage(
+                    content=json.dumps(
+                        {
+                            "draft_answer": draft_answer,
+                            "evidence": [
+                                item.model_dump(mode="json") for item in evidence
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
+        )
+        if generated.kind is not OutcomeKind.ANSWER:
+            return _evidence_backed_outcome(draft_answer, evidence)
+        if _claim_errors(generated, evidence):
+            return _evidence_backed_outcome(draft_answer, evidence)
+        return generated
 
     def finalize_node(state: AgentState) -> dict[str, object]:
         decision = tracker.evaluate(
             needs=state["understanding"].needs,
             entities=state.get("parsed_entities", []),
-            evidence=_called_tool_evidence(state["messages"]),
+            evidence=state.get("evidence", []),
         )
         update: dict[str, object] = {
             "requirement_status": decision.status,
             "missing_evidence": list(decision.missing_evidence),
         }
 
+        outcome: AgentOutcome | None = None
         if decision.status is RequirementStatus.UNSUPPORTED:
             reasons = [
                 CAPABILITY_TABLE[need].unsupported_reason
@@ -207,30 +371,54 @@ def create_order_agent():
                 if CAPABILITY_TABLE[need].unsupported_reason
             ]
             reason = "".join(reasons) or "该请求超出当前拼团诊断能力范围。"
-            update["messages"] = [
-                AIMessage(
-                    content=f"{reason}请联系人工客服处理。"
-                )
-            ]
+            outcome = _capability_outcome(
+                OutcomeKind.HANDOFF,
+                f"{reason}请联系人工客服处理。",
+            )
         elif decision.status is RequirementStatus.NEED_USER_INPUT:
-            update["messages"] = [AIMessage(content=_request_input(decision))]
+            outcome = _capability_outcome(
+                OutcomeKind.REQUEST_INPUT,
+                _request_input(decision),
+            )
         elif decision.status is RequirementStatus.NEED_MORE_EVIDENCE:
-            if state.get("agent_rounds", 0) >= 2:
-                update["messages"] = [
-                    AIMessage(
-                        content="缺少完成查询所需的业务信息，请联系人工客服处理。"
+            if (
+                any(
+                    path.startswith("search_group_buy_rules.matches.")
+                    for path in decision.missing_evidence
+                )
+                and _has_empty_rule_search(state["messages"])
+            ):
+                outcome = _capability_outcome(
+                    OutcomeKind.HANDOFF,
+                    "未检索到支持该问题的拼团规则，请联系人工客服处理。",
+                )
+            elif state.get("agent_rounds", 0) >= 2:
+                if _has_tool_code(state["messages"], "SERVICE_UNAVAILABLE"):
+                    outcome = _capability_outcome(
+                        OutcomeKind.ANSWER,
+                        "业务服务暂时不可用，暂时无法查询。",
                     )
-                ]
+                else:
+                    outcome = _capability_outcome(
+                        OutcomeKind.HANDOFF,
+                        "缺少完成查询所需的业务证据，请联系人工客服处理。",
+                    )
             else:
                 missing = "、".join(decision.missing_evidence)
                 update["messages"] = [
                     SystemMessage(
                         content=(
-                            "RequirementTracker 判定仍缺少以下临时 Evidence："
+                            "RequirementTracker 判定仍缺少以下 Evidence path："
                             f"{missing}。请调用对应 Tool 后再回答。"
                         )
                     )
                 ]
+        elif decision.status is RequirementStatus.ANSWERABLE:
+            outcome = answer_outcome(state)
+
+        if outcome is not None:
+            update["outcome"] = outcome
+            update["messages"] = [AIMessage(content=outcome.final_answer)]
         return update
 
     def route_after_finalize(state: AgentState) -> str:

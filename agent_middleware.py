@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import (
+    AgentState as MiddlewareAgentState,
     ModelCallLimitMiddleware,
     ToolCallLimitMiddleware,
     wrap_tool_call,
 )
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Command
 
+from evidence import Evidence, EvidenceType, merge_evidence
 from understanding import EntityType
 
 
@@ -23,6 +26,10 @@ ENTITY_PARAMETERS: dict[str, dict[str, EntityType]] = {
 FREE_TEXT_PARAMETERS: dict[str, tuple[str, ...]] = {
     "search_group_buy_rules": ("query",),
 }
+
+
+class EvidenceState(MiddlewareAgentState):
+    evidence: NotRequired[Annotated[list[Evidence], merge_evidence]]
 
 
 def _error_message(request: Any, code: str, message: str) -> ToolMessage:
@@ -58,6 +65,82 @@ def _parse_tool_payload(message: ToolMessage) -> dict[str, Any] | None:
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
     return payload
+
+
+def _path_key(key: str) -> str:
+    parts = key.split("_")
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _fact_evidence(tool_name: str, data: Any) -> list[Evidence]:
+    evidence: list[Evidence] = []
+
+    def visit(value: Any, path: list[str]) -> None:
+        rendered_path = ".".join([tool_name, *path])
+        if isinstance(value, dict):
+            if not value:
+                evidence.append(
+                    Evidence(path=rendered_path, type=EvidenceType.FACT, value={})
+                )
+                return
+            for key, child in value.items():
+                visit(child, [*path, _path_key(str(key))])
+            return
+        if isinstance(value, list):
+            evidence.append(
+                Evidence(path=rendered_path, type=EvidenceType.FACT, value=value)
+            )
+            for index, child in enumerate(value):
+                visit(child, [*path, str(index)])
+            return
+        evidence.append(
+            Evidence(path=rendered_path, type=EvidenceType.FACT, value=value)
+        )
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            visit(value, [_path_key(str(key))])
+    return evidence
+
+
+def _rule_query_is_traceable(query: Any, user_text: str) -> bool:
+    if not isinstance(query, str) or not query.strip():
+        return False
+    query_characters = set(re.findall(r"[a-z0-9\u4e00-\u9fff]", query.lower()))
+    user_characters = set(
+        re.findall(r"[a-z0-9\u4e00-\u9fff]", user_text.lower())
+    )
+    return bool(query_characters) and query_characters.issubset(user_characters)
+
+
+def _rule_evidence(
+    tool_name: str,
+    data: Any,
+    user_text: str,
+) -> list[Evidence]:
+    if not isinstance(data, dict) or not isinstance(data.get("matches"), list):
+        return []
+    if not _rule_query_is_traceable(data.get("query"), user_text):
+        return []
+    return [
+        Evidence(
+            path=f"{tool_name}.matches.{index}",
+            type=EvidenceType.RULE,
+            value=match,
+        )
+        for index, match in enumerate(data["matches"])
+    ]
+
+
+def _collect_evidence(message: ToolMessage, user_text: str) -> list[Evidence]:
+    payload = _parse_tool_payload(message)
+    if payload is None:
+        return []
+    tool_name = message.name or ""
+    data = payload.get("data")
+    if tool_name == "search_group_buy_rules":
+        return _rule_evidence(tool_name, data, user_text)
+    return _fact_evidence(tool_name, data)
 
 
 def _collect_observation_entities(value: Any) -> dict[EntityType, set[str | int]]:
@@ -273,10 +356,26 @@ def RepeatGuard(request: Any, handler: Any) -> ToolMessage:
     return handler(request)
 
 
+@wrap_tool_call(state_schema=EvidenceState)
+def EvidenceCollector(request: Any, handler: Any) -> ToolMessage | Command[Any]:
+    """Convert successful business facts into stable, addressable Evidence."""
+    response = handler(request)
+    if not isinstance(response, ToolMessage):
+        return response
+    collected = _collect_evidence(
+        response,
+        getattr(request.runtime.context, "user_text", ""),
+    )
+    if not collected:
+        return response
+    return Command(update={"messages": [response], "evidence": collected})
+
+
 def create_agent_middleware() -> list[Any]:
     return [
         RepeatGuard,
         GroundingGuard,
+        EvidenceCollector,
         ToolCallLimitMiddleware(run_limit=8, exit_behavior="continue"),
         ModelCallLimitMiddleware(run_limit=6, exit_behavior="end"),
     ]

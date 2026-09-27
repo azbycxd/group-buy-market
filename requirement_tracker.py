@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Iterable, TypeVar
 
+from evidence import Evidence
 from understanding import EntityType, InformationNeed, ParsedEntity
 
 
@@ -26,27 +27,29 @@ CAPABILITY_TABLE: dict[InformationNeed, Capability] = {
     InformationNeed.ORDER_STATUS: Capability(
         supported=True,
         required_entities=(EntityType.ORDER,),
-        required_evidence=("get_order_facts",),
+        required_evidence=("get_order_facts.order.status",),
     ),
     InformationNeed.ACTIVITY_VALIDITY: Capability(
         supported=True,
         required_entities=(EntityType.ACTIVITY,),
-        required_evidence=("get_activity_facts",),
+        required_evidence=("get_activity_facts.activity.withinValidTime",),
     ),
     InformationNeed.USER_ELIGIBILITY: Capability(
         supported=True,
         required_entities=(EntityType.ACTIVITY,),
-        required_evidence=("get_user_eligibility_facts",),
+        required_evidence=(
+            "get_user_eligibility_facts.participationLimitReached",
+        ),
     ),
     InformationNeed.JOINABLE_TEAMS: Capability(
         supported=True,
         required_entities=(EntityType.ACTIVITY,),
-        required_evidence=("get_joinable_team_facts",),
+        required_evidence=("get_joinable_team_facts.candidateTeams",),
     ),
     InformationNeed.RULE_EXPLANATION: Capability(
         supported=True,
         required_entities=(),
-        required_evidence=("search_group_buy_rules",),
+        required_evidence=("search_group_buy_rules.matches.*",),
     ),
     InformationNeed.REFUND_ARRIVAL: Capability(
         supported=False,
@@ -59,7 +62,7 @@ CAPABILITY_TABLE: dict[InformationNeed, Capability] = {
     InformationNeed.REFUND_REQUEST: Capability(
         supported=True,
         required_entities=(),
-        required_evidence=("search_group_buy_rules",),
+        required_evidence=("search_group_buy_rules.matches.*",),
     ),
     InformationNeed.OUT_OF_SCOPE: Capability(
         supported=False,
@@ -92,7 +95,7 @@ class RequirementTracker:
         self,
         needs: list[InformationNeed],
         entities: list[ParsedEntity],
-        evidence: Iterable[str],
+        evidence: Iterable[Evidence],
     ) -> RequirementDecision:
         unsupported_needs = _unique(
             need for need in needs if not CAPABILITY_TABLE[need].supported
@@ -116,12 +119,12 @@ class RequirementTracker:
                 missing_entities=missing_entities,
             )
 
-        available_evidence = set(evidence)
+        available_evidence = {item.path for item in evidence}
         missing_evidence = _unique(
             evidence_name
             for need in needs
             for evidence_name in CAPABILITY_TABLE[need].required_evidence
-            if evidence_name not in available_evidence
+            if not _has_required_evidence(evidence_name, available_evidence)
         )
         if missing_evidence:
             return RequirementDecision(
@@ -130,3 +133,10 @@ class RequirementTracker:
             )
 
         return RequirementDecision(status=RequirementStatus.ANSWERABLE)
+
+
+def _has_required_evidence(requirement: str, available_paths: set[str]) -> bool:
+    if requirement.endswith(".*"):
+        prefix = requirement[:-1]
+        return any(path.startswith(prefix) for path in available_paths)
+    return requirement in available_paths
