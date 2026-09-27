@@ -1,12 +1,13 @@
+import argparse
 import json
 import os
-import sys
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, ToolMessage
 
-from agent import create_order_agent
+from agent import DEFAULT_CHECKPOINT_PATH, close_order_agent, create_order_agent
 from tools.context import AgentContext
 
 
@@ -41,18 +42,39 @@ def _tool_result(content: Any) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit('用法: python cli.py "订单 ORD100001 现在什么状态"')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("question")
+    parser.add_argument(
+        "--session-id",
+        default=os.getenv("AGENT_SESSION_ID", "cli-default"),
+    )
+    parser.add_argument(
+        "--checkpoint-db",
+        type=Path,
+        default=Path(
+            os.getenv("CHECKPOINT_DB_PATH", str(DEFAULT_CHECKPOINT_PATH))
+        ),
+    )
+    args = parser.parse_args()
 
     load_dotenv()
-    agent = create_order_agent()
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": sys.argv[1]}]},
-        context=AgentContext(user_id=os.getenv("AGENT_USER_ID", "demo-user")),
-    )
+    agent = create_order_agent(args.checkpoint_db)
+    config = {"configurable": {"thread_id": args.session_id}}
+    try:
+        snapshot = agent.get_state(config)
+        previous_message_count = len(snapshot.values.get("messages", []))
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": args.question}]},
+            context=AgentContext(
+                user_id=os.getenv("AGENT_USER_ID", "demo-user")
+            ),
+            config=config,
+        )
+    finally:
+        close_order_agent(agent)
 
     final_answer: Any = ""
-    for message in result["messages"]:
+    for message in result["messages"][previous_message_count:]:
         if isinstance(message, AIMessage):
             for call in message.tool_calls:
                 print(_format_tool_call(call["name"], call["args"]))

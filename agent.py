@@ -1,5 +1,7 @@
 import json
 import os
+import sqlite3
+from pathlib import Path
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -14,6 +16,8 @@ from langchain_core.messages import (
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.runtime import Runtime
 
 from agent_middleware import create_agent_middleware
@@ -37,11 +41,15 @@ from understanding import (
     ParsedEntity,
     Understanding,
     create_understander,
+    resolve_pending_entities,
     understand_text,
 )
 
 
 load_dotenv(override=True)
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_CHECKPOINT_PATH = PROJECT_ROOT / "data" / "checkpoints.sqlite"
 
 
 def _required_env(name: str) -> str:
@@ -87,6 +95,8 @@ class AgentState(TypedDict, total=False):
     understanding: Understanding
     parsed_entities: list[ParsedEntity]
     requirement_status: RequirementStatus
+    pending_needs: list[InformationNeed]
+    pending_missing_entities: list[EntityType]
     missing_evidence: list[str]
     agent_rounds: int
     evidence: Annotated[list[Evidence], merge_evidence]
@@ -240,7 +250,45 @@ def _entity_context(entities: list[ParsedEntity]) -> str:
     )
 
 
-def create_order_agent():
+def _merge_entities(
+    existing: list[ParsedEntity],
+    recovered: list[ParsedEntity],
+) -> list[ParsedEntity]:
+    merged: dict[tuple[EntityType, str | int], ParsedEntity] = {
+        (entity.entity_type, entity.value): entity for entity in existing
+    }
+    for entity in recovered:
+        merged[(entity.entity_type, entity.value)] = entity
+    return list(merged.values())
+
+
+def create_order_agent(
+    checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
+):
+    checkpoint_file = Path(checkpoint_path).resolve()
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_connection = sqlite3.connect(
+        checkpoint_file,
+        check_same_thread=False,
+    )
+    checkpointer = SqliteSaver(
+        checkpoint_connection,
+        serde=JsonPlusSerializer(
+            allowed_msgpack_modules=[
+                InformationNeed,
+                EntityType,
+                ParsedEntity,
+                Understanding,
+                RequirementStatus,
+                Evidence,
+                EvidenceType,
+                AgentOutcome,
+                OutcomeKind,
+                Claim,
+                ClaimType,
+            ]
+        ),
+    )
     model = _create_model()
     understander = create_understander(model)
     outcome_generator = model.with_structured_output(
@@ -253,6 +301,34 @@ def create_order_agent():
 
     def understand_node(state: AgentState) -> dict[str, object]:
         user_text = _latest_user_text(state["messages"])
+        pending_needs = state.get("pending_needs", [])
+        pending_missing = state.get("pending_missing_entities", [])
+        if (
+            state.get("requirement_status") is RequirementStatus.NEED_USER_INPUT
+            and pending_needs
+            and pending_missing
+        ):
+            parsed_entities = _merge_entities(
+                state.get("parsed_entities", []),
+                resolve_pending_entities(user_text, pending_missing),
+            )
+            available_types = {
+                entity.entity_type for entity in parsed_entities
+            }
+            remaining = [
+                entity_type
+                for entity_type in pending_missing
+                if entity_type not in available_types
+            ]
+            return {
+                "understanding": Understanding(
+                    needs=pending_needs,
+                    entities=[],
+                ),
+                "parsed_entities": parsed_entities,
+                "pending_missing_entities": remaining,
+            }
+
         understanding, parsed_entities = understand_text(
             understander,
             user_text,
@@ -260,6 +336,8 @@ def create_order_agent():
         return {
             "understanding": understanding,
             "parsed_entities": parsed_entities,
+            "pending_needs": [],
+            "pending_missing_entities": [],
         }
 
     def agent_node(
@@ -338,6 +416,7 @@ def create_order_agent():
         )
         update: dict[str, object] = {
             "requirement_status": decision.status,
+            "pending_missing_entities": list(decision.missing_entities),
             "missing_evidence": list(decision.missing_evidence),
         }
 
@@ -354,11 +433,13 @@ def create_order_agent():
                 f"{reason}请联系人工客服处理。",
             )
         elif decision.status is RequirementStatus.NEED_USER_INPUT:
+            update["pending_needs"] = list(state["understanding"].needs)
             outcome = _capability_outcome(
                 OutcomeKind.REQUEST_INPUT,
                 _request_input(decision),
             )
         elif decision.status is RequirementStatus.NEED_MORE_EVIDENCE:
+            update["pending_needs"] = []
             if (
                 any(
                     path.startswith("search_group_buy_rules.matches.")
@@ -392,6 +473,7 @@ def create_order_agent():
                     )
                 ]
         elif decision.status is RequirementStatus.ANSWERABLE:
+            update["pending_needs"] = []
             outcome = answer_outcome(state)
 
         if outcome is not None:
@@ -420,4 +502,11 @@ def create_order_agent():
         route_after_finalize,
         {"agent": "agent", "end": END},
     )
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+
+
+def close_order_agent(agent: object) -> None:
+    checkpointer = getattr(agent, "checkpointer", None)
+    connection = getattr(checkpointer, "conn", None)
+    if connection is not None:
+        connection.close()

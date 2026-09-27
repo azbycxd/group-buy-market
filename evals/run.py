@@ -6,8 +6,10 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,22 +172,24 @@ def invoke_case(
     agent: Any,
     context_type: Any,
     case: dict[str, Any],
+    session_id: str | None = None,
 ) -> tuple[dict[str, Any], int, float]:
     counter = TokenCounter()
     context = context_type(user_id=case.get("user_id", "demo-user"))
     turns = case.get("turns") or [case["input"]]
-    conversation: list[Any] = []
+    session_id = session_id or f"eval-{case['id']}-{uuid.uuid4().hex}"
     result: dict[str, Any] = {}
     started_at = time.perf_counter()
 
     for turn in turns:
-        messages = [*conversation, HumanMessage(content=turn)]
         result = agent.invoke(
-            {"messages": messages},
+            {"messages": [HumanMessage(content=turn)]},
             context=context,
-            config={"callbacks": [counter]},
+            config={
+                "callbacks": [counter],
+                "configurable": {"thread_id": session_id},
+            },
         )
-        conversation = result["messages"]
 
     return result, counter.total_tokens, time.perf_counter() - started_at
 
@@ -407,12 +411,18 @@ def main() -> None:
     port = free_port()
     fake_java = start_fake_java(port)
     original_base_url = os.environ.get("FAKE_JAVA_BASE_URL")
+    checkpoint_directory = tempfile.TemporaryDirectory(
+        prefix="group-buy-agent-eval-"
+    )
+    agent: Any | None = None
 
     try:
-        from agent import create_order_agent
+        from agent import close_order_agent, create_order_agent
         from tools.context import AgentContext
 
-        agent = create_order_agent()
+        agent = create_order_agent(
+            Path(checkpoint_directory.name) / "checkpoints.sqlite"
+        )
         results: list[CaseRuns] = []
         for case in cases:
             runs: list[EvalRun] = []
@@ -424,7 +434,12 @@ def main() -> None:
                 )
                 started_at = time.perf_counter()
                 try:
-                    result, tokens, latency = invoke_case(agent, AgentContext, case)
+                    result, tokens, latency = invoke_case(
+                        agent,
+                        AgentContext,
+                        case,
+                        session_id=f"eval-{case['id']}-{uuid.uuid4().hex}",
+                    )
                     runs.append(evaluate_result(result, case, tokens, latency))
                 except Exception as error:
                     runs.append(
@@ -446,6 +461,9 @@ def main() -> None:
         print_case_results(results)
         print_metrics(results)
     finally:
+        if agent is not None:
+            close_order_agent(agent)
+        checkpoint_directory.cleanup()
         if original_base_url is None:
             os.environ.pop("FAKE_JAVA_BASE_URL", None)
         else:

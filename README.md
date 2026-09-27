@@ -7,6 +7,7 @@ Group Buy Agent 是阶段 A 的拼团业务诊断原型：使用真实大模型�
 ```mermaid
 flowchart LR
     U[用户问题] --> N[understand<br/>InformationNeed + 实体原文]
+    CP[(SQLite Checkpointer<br/>thread_id 图状态)] <--> N
     N --> P[确定性实体解析<br/>ParsedEntity]
     P --> R[RequirementTracker<br/>CAPABILITY_TABLE]
     R -->|需要证据| A[LangChain create_agent<br/>按 need 限制 Tool]
@@ -44,6 +45,16 @@ python -m uvicorn fake_java.main:app --host 127.0.0.1 --port 8000
 python cli.py "订单 ORD100001 现在什么状态"
 ```
 
+需要跨进程继续同一会话时，复用同一个 `session_id`：
+
+```powershell
+python cli.py --session-id b1-demo "这个活动还有效吗"
+python cli.py --session-id b1-demo "100123"
+```
+
+默认 checkpoint 文件为 `data/checkpoints.sqlite`，也可以通过
+`--checkpoint-db` 或 `CHECKPOINT_DB_PATH` 指定其他磁盘路径。
+
 运行完整真实模型评测：
 
 ```powershell
@@ -52,28 +63,36 @@ python -m evals.run
 
 ## 当前评测结果
 
-评测日期：2026-09-27。使用环境变量配置的真实 DeepSeek 模型，每条 Case 独立运行 3 次；`expected_failure` 不计入当前能力通过率。
+评测日期：2026-09-27。使用环境变量配置的真实 DeepSeek 模型，每条 Case 运行 3 次；每次使用独立 `session_id`，同一多轮 Case 的各轮复用该 `session_id`。
 
 | 指标 | 结果 |
 | --- | ---: |
 | Case 总数 | 60 |
-| 当前能力 Case | 54 |
-| expected_failure Case | 6 |
-| 当前能力单次通过 | 143 / 162（88.27%） |
-| 单次通过率 Wilson 95% CI | 82.41%–92.36% |
-| 3 次全过 | 44 / 54（81.48%） |
-| 3 次全过率 Wilson 95% CI | 69.16%–89.62% |
-| 平均 token | 2825.60 |
-| 平均延迟 | 2.994 秒 |
-| expected_failure 单次通过 | 9 / 18 |
+| 正式 Case | 60 |
+| 单次通过 | 166 / 180（92.22%） |
+| 单次通过率 Wilson 95% CI | 87.37%–95.31% |
+| 3 次全过 | 53 / 60（88.33%） |
+| 3 次全过率 Wilson 95% CI | 77.82%–94.23% |
+| 平均 token | 2954.74 |
+| 平均延迟 | 3.295 秒 |
 
-Case 分类：参团诊断 12、订单 10、可加入团队 8、规则问答 10、能力不支持 8、参数 / 注入 6、多轮补参数 6。多轮补参数中有 3 个 Case XPASS、3 个 Case XFAIL，留待 B1 正式实现。
+Case 分类：参团诊断 12、订单 10、可加入团队 8、规则问答 10、能力不支持 8、参数 / 注入 6、多轮补参数 6。6 条多轮补参数 Case 已全部转为正式 Case，本次均为 3/3 PASS。
 
 ## 已知限制
 
 - 当前 ClaimVerifier 只能验证 Evidence path 存在和类型，不能确定自然语言 Claim 的语义是否真的被该 Evidence 支持。
-- 多轮补参数尚未作为正式能力实现，相关 Case 当前标记为 `expected_failure`。
 - 规则检索与模型生成仍可能受问法影响；当前评测不使用 LLM Judge，只进行确定性校验。
 - `fake_java` 和开发用户身份仅用于本地联调，不代表生产认证与真实业务数据。
 - 系统是只读诊断 Agent，不能确认支付渠道退款到账，也不执行订单修改等写操作。
 - 当前没有 Memory 或 RAG。
+
+## Checkpointer 与 Store
+
+Checkpointer 保存某个 `thread_id` 对应的 LangGraph State checkpoint。当前
+SQLite checkpoint 包含 messages、understanding、parsed entities、requirement
+status、pending needs、pending missing entities、Evidence 和 Outcome 等图状态。
+图运行到 checkpoint 时将状态写入磁盘；下次使用相同 `thread_id` 调用时，
+StateGraph 会从持久化状态继续执行。因此参数补充不依赖解析上一轮的自然语言回复。
+
+Store 用于跨 thread 或更长期的应用记忆、用户记忆，不等于当前工作流的执行
+状态。B1 只实现 Checkpointer，不实现 Store 或长期记忆。

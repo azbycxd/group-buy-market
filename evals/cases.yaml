@@ -424,7 +424,6 @@
   required_tools: [get_user_eligibility_facts]
   required_evidence: [get_user_eligibility_facts.participationLimitReached]
   forbidden_claim_terms: []
-  expected_failure: true
 
 - id: multi_order
   category: 多轮补参数
@@ -433,7 +432,6 @@
   required_tools: [get_order_facts]
   required_evidence: [get_order_facts.order.status]
   forbidden_claim_terms: []
-  expected_failure: true
 
 - id: multi_joinable_team
   category: 多轮补参数
@@ -442,7 +440,6 @@
   required_tools: [get_joinable_team_facts]
   required_evidence: [get_joinable_team_facts.candidateTeams]
   forbidden_claim_terms: []
-  expected_failure: true
 
 - id: multi_activity_validity
   category: 多轮补参数
@@ -451,7 +448,6 @@
   required_tools: [get_activity_facts]
   required_evidence: [get_activity_facts.activity.withinValidTime]
   forbidden_claim_terms: []
-  expected_failure: true
 
 - id: multi_diagnosis
   category: 多轮补参数
@@ -460,7 +456,6 @@
   required_tools: [get_activity_facts, get_user_eligibility_facts, get_joinable_team_facts]
   required_evidence: [get_activity_facts.activity.withinValidTime, get_user_eligibility_facts.participationLimitReached, get_joinable_team_facts.candidateTeams]
   forbidden_claim_terms: []
-  expected_failure: true
 
 - id: multi_order_user002
   category: 多轮补参数
@@ -470,4 +465,3 @@
   required_tools: [get_order_facts]
   required_evidence: [get_order_facts.order.status]
   forbidden_claim_terms: []
-  expected_failure: true

@@ -142,6 +142,46 @@ def resolve_entities(
     return parsed
 
 
+def resolve_pending_entities(
+    user_text: str,
+    missing_entities: list[EntityType],
+) -> list[ParsedEntity]:
+    """Deterministically parse values requested by a pending requirement."""
+    parsed: list[ParsedEntity] = []
+
+    for entity_type in dict.fromkeys(missing_entities):
+        try:
+            if entity_type is EntityType.ORDER:
+                match = _ORDER_NUMBER.search(user_text)
+                if match is None:
+                    continue
+                value = OrderFactsArguments.model_validate(
+                    {"outTradeNo": match.group(1)}
+                ).outTradeNo
+                field_name = "outTradeNo"
+            else:
+                match = _ACTIVITY_ID.search(user_text)
+                if match is None:
+                    continue
+                value = ActivityIdArguments.model_validate(
+                    {"activityId": int(match.group(1))}
+                ).activityId
+                field_name = "activityId"
+        except (TypeError, ValueError):
+            continue
+
+        parsed.append(
+            ParsedEntity(
+                entity_type=entity_type,
+                source_text=match.group(0).strip(),
+                field_name=field_name,
+                value=value,
+            )
+        )
+
+    return parsed
+
+
 def create_understander(model: Any) -> Any:
     return model.with_structured_output(
         Understanding,
