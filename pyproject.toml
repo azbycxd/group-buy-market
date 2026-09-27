@@ -18,5 +18,5 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["agent", "cli"]
+py-modules = ["agent", "cli", "understanding"]
 packages = ["fake_java", "tools"]
