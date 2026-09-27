@@ -37,6 +37,7 @@ class EvalRun:
     tools: list[str]
     evidence_paths: list[str]
     understanding: list[str]
+    rule_queries: list[str]
     rule_matches: list[dict[str, Any]]
     token_count: int
     latency_seconds: float
@@ -233,6 +234,11 @@ def evaluate_result(
         for call in message.tool_calls
     ]
     tool_calls = [call["name"] for call in tool_call_records]
+    rule_queries = [
+        str(call.get("args", {}).get("query", ""))
+        for call in tool_call_records
+        if call["name"] == "search_group_buy_rules"
+    ]
     evidence = result.get("evidence", [])
     evidence_paths = [item.path for item in evidence]
     evidence_types = {item.path: item.type for item in evidence}
@@ -241,6 +247,17 @@ def evaluate_result(
         getattr(need, "value", str(need))
         for need in getattr(understanding, "needs", [])
     ]
+    oracle_path: dict[str, Any] | None = None
+    oracle_paths = case.get("oracle_paths", [])
+    if oracle_paths:
+        oracle_path = next(
+            (
+                path
+                for path in oracle_paths
+                if path.get("understanding", []) == understanding_needs
+            ),
+            None,
+        )
     rule_matches: list[dict[str, Any]] = []
     for message in result.get("messages", []):
         if not isinstance(message, ToolMessage) or message.name != (
@@ -262,6 +279,14 @@ def evaluate_result(
             )
 
     reasons: list[str] = []
+    if oracle_paths and oracle_path is None:
+        allowed_understanding = [
+            path.get("understanding", []) for path in oracle_paths
+        ]
+        reasons.append(
+            "Understanding 不符合允许路径: "
+            + json.dumps(allowed_understanding, ensure_ascii=False)
+        )
     raw_outcome = result.get("outcome")
     try:
         outcome = AgentOutcome.model_validate(raw_outcome)
@@ -276,9 +301,12 @@ def evaluate_result(
             f"action 允许 {'/'.join(allowed_actions)}，实际 {actual_action}"
         )
 
-    missing_tools = [
-        name for name in case.get("required_tools", []) if name not in tool_calls
-    ]
+    required_tools = (
+        oracle_path.get("required_tools", [])
+        if oracle_path is not None
+        else case.get("required_tools", [])
+    )
+    missing_tools = [name for name in required_tools if name not in tool_calls]
     if missing_tools:
         reasons.append(f"缺少 Tool: {', '.join(missing_tools)}")
 
@@ -318,6 +346,16 @@ def evaluate_result(
     ]
     if forbidden_evidence:
         reasons.append(f"出现禁用 Evidence: {', '.join(forbidden_evidence)}")
+
+    if (
+        oracle_path is not None
+        and "expected_rule_matches" in oracle_path
+        and rule_matches != oracle_path["expected_rule_matches"]
+    ):
+        reasons.append(
+            "Rule matches 不符合预期: "
+            + json.dumps(rule_matches, ensure_ascii=False)
+        )
 
     if outcome is not None:
         expected_final = "\n".join(claim.text for claim in outcome.claims)
@@ -378,6 +416,7 @@ def evaluate_result(
         tools=tool_calls,
         evidence_paths=evidence_paths,
         understanding=understanding_needs,
+        rule_queries=rule_queries,
         rule_matches=rule_matches,
         token_count=token_count,
         latency_seconds=latency_seconds,
@@ -533,6 +572,7 @@ def main() -> None:
                             tools=[],
                             evidence_paths=[],
                             understanding=[],
+                            rule_queries=[],
                             rule_matches=[],
                             token_count=0,
                             latency_seconds=time.perf_counter() - started_at,
@@ -551,6 +591,11 @@ def main() -> None:
                                 "case_id": case["id"],
                                 "run": run_number,
                                 "understanding": run.understanding,
+                                "query": run.rule_queries,
+                                "user_text": (
+                                    case.get("input")
+                                    or case.get("turns", [""])[-1]
+                                ),
                                 "search_called": (
                                     "search_group_buy_rules" in run.tools
                                 ),

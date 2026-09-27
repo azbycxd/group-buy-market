@@ -149,7 +149,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.SUCCESS,
                     status="SUCCEEDED",
-                    result_code="REFUND_ACCEPTED",
+                    result_code="REFUND_SUCCEEDED",
                     refund_executed=True,
                     idempotent_replay=True,
                 ),
@@ -160,7 +160,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
         self.assertEqual(result["final_status"], "SUCCEEDED")
         self.assertEqual(result["retry_count"], 1)
         self.assertEqual(current["version"], 5)
-        self.assertEqual(current["result_code"], "REFUND_ACCEPTED")
+        self.assertEqual(current["result_code"], "REFUND_SUCCEEDED")
         self.assertEqual(current["refund_executed"], 1)
         self.assertEqual(keys, [action["idempotency_key"]] * 2)
 
@@ -219,7 +219,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.SUCCESS,
                     status="SUCCEEDED",
-                    result_code="REFUND_ACCEPTED",
+                    result_code="REFUND_SUCCEEDED",
                     refund_executed=True,
                 )
             ],
@@ -228,7 +228,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
         current = self.store.get_action(str(action["action_id"]))
         self.assertEqual(result["final_status"], "SUCCEEDED")
         self.assertEqual(current["status"], "SUCCEEDED")
-        self.assertEqual(current["result_code"], "REFUND_ACCEPTED")
+        self.assertEqual(current["result_code"], "REFUND_SUCCEEDED")
         self.assertEqual(current["refund_executed"], 1)
         self.assertIn("暂时无法查询最新订单状态", result["message"])
         self.assertEqual(keys, [action["idempotency_key"]])
@@ -242,7 +242,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.SUCCESS,
                     status="SUCCEEDED",
-                    result_code="REFUND_ACCEPTED",
+                    result_code="REFUND_SUCCEEDED",
                     refund_executed=True,
                 )
             ],

@@ -398,7 +398,7 @@ async def execute_refund(
         preview["orderStatus"] = "CLOSE"
         result = {
             "status": "SUCCEEDED",
-            "resultCode": "REFUND_ACCEPTED",
+            "resultCode": "REFUND_SUCCEEDED",
             "refundExecuted": True,
             "idempotentReplay": False,
         }

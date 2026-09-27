@@ -306,7 +306,11 @@
   category: 规则问答
   input: "拼团购买后能开增值税发票吗？"
   expected_action: HANDOFF
-  required_tools: [search_group_buy_rules]
+  oracle_paths:
+    - understanding: [OUT_OF_SCOPE]
+    - understanding: [RULE_EXPLANATION]
+      required_tools: [search_group_buy_rules]
+      expected_rule_matches: []
   forbidden_evidence: [search_group_buy_rules.matches.*]
   forbidden_claim_terms: ["可以开票", "不能开票"]
 
