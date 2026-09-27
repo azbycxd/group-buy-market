@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.runtime import Runtime
 
+from agent_middleware import create_agent_middleware
 from requirement_tracker import (
     CAPABILITY_TABLE,
     RequirementDecision,
@@ -165,6 +166,7 @@ def create_order_agent():
             inner_agent = create_agent(
                 model=model,
                 tools=tools,
+                middleware=create_agent_middleware(),
                 context_schema=AgentContext,
                 system_prompt=SYSTEM_PROMPT,
             )
@@ -176,7 +178,11 @@ def create_order_agent():
         inner_messages = [entity_message, *state["messages"]]
         result = inner_agent.invoke(
             {"messages": inner_messages},
-            context=runtime.context,
+            context=AgentContext(
+                user_id=runtime.context.user_id,
+                parsed_entities=tuple(state.get("parsed_entities", [])),
+                user_text=_latest_user_text(state["messages"]),
+            ),
         )
         return {
             "messages": result["messages"][len(inner_messages):],
