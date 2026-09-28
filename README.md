@@ -190,7 +190,9 @@ Case 分类：参团诊断 12、订单 10、可加入团队 8、规则问答 10�
 - 规则检索与模型生成仍可能受问法影响；当前评测不使用 LLM Judge，只进行确定性校验。
 - `fake_java` 和开发用户身份仅用于本地联调，不代表生产认证与真实业务数据。
 - 系统是只读诊断 Agent，不能确认支付渠道退款到账，也不执行订单修改等写操作。
-- 当前没有 Memory 或 RAG。
+- 规则问答已使用本地 BM25 + Dense + RRF + CrossEncoder Rerank；默认
+  `RAG_RERANK_THRESHOLD=0.85` 来自 D2.1 同一样本上的探索，不代表泛化性能结论。
+- 当前没有 Memory，也未进行 D3b 答案级 RAG 评测。
 
 ## Checkpointer 与 Store
 

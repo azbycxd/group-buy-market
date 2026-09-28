@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import (
@@ -228,32 +227,10 @@ def _entity_error(
     return None
 
 
-def _text_anchors(value: str) -> set[str]:
-    lowered = value.lower()
-    latin = {
-        token
-        for token in re.findall(r"[a-z0-9]+", lowered)
-        if len(token) >= 2
-    }
-    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
-    bigrams = {
-        chinese[index : index + 2]
-        for index in range(max(0, len(chinese) - 1))
-    }
-    return latin | bigrams
-
-
 def _query_error(value: Any, request: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return "参数 query 类型不正确，且没有匹配的可信来源。"
-    user_text = getattr(request.runtime.context, "user_text", "").strip()
-    normalized_query = re.sub(r"\s+", "", value).lower()
-    normalized_user = re.sub(r"\s+", "", user_text).lower()
-    if normalized_query in normalized_user or normalized_user in normalized_query:
-        return None
-    if _text_anchors(value) & _text_anchors(user_text):
-        return None
-    return "参数 query 无法追溯到用户原文，禁止执行 Tool。"
+    return None
 
 
 @wrap_tool_call

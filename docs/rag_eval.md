@@ -259,3 +259,83 @@
 | Rerank score | 0.845828 | 2 | 0 | 0.9500 | 1.0000 | 0.9750 |
 
 > 阈值和指标来自同一小样本集，仅作为 D3 的探索信号，不能视为泛化性能结论。
+
+## D2.1 CrossEncoder Rerank + 拒答信号对比 — 2026-09-28T13:29:56+00:00
+
+- Dense model：`BAAI/bge-small-zh-v1.5`
+- Reranker：`BAAI/bge-reranker-base`，sentence-transformers CrossEncoder，CPU
+- 候选：RRF Top10；输入仅为 `(query, title + content)`
+- 样本：正式集 answerable=30、unanswerable=10；hard answerable=10
+
+### 正式集（30 answerable）
+
+| Method | Recall@1 | Recall@3 | Recall@5 | MRR |
+|---|---:|---:|---:|---:|
+| BM25 | 0.6667 | 0.8000 | 0.8667 | 0.7651 |
+| Dense | 0.7667 | 0.9000 | 1.0000 | 0.8456 |
+| RRF | 0.7333 | 0.9667 | 1.0000 | 0.8567 |
+| RRF+Rerank | 0.9000 | 0.9333 | 1.0000 | 0.9317 |
+
+### 人工 hard 集（10 answerable，独立统计）
+
+| Method | Recall@1 | Recall@3 | Recall@5 | MRR |
+|---|---:|---:|---:|---:|
+| BM25 | 0.6000 | 0.8000 | 0.9000 | 0.7119 |
+| Dense | 0.6000 | 0.9000 | 1.0000 | 0.7750 |
+| RRF | 0.8000 | 0.9000 | 0.9000 | 0.8625 |
+| RRF+Rerank | 0.7000 | 1.0000 | 1.0000 | 0.8500 |
+
+### Rerank CPU 延迟
+
+- 环境：Windows-10-10.0.19045-SP0；CPU=Intel64 Family 6 Model 151 Stepping 5, GenuineIntel；logical_cores=12；PyTorch=2.14.0+cpu；torch_threads=6
+- 候选数：Top10；query 数：50
+- mean=437.59 ms，p50=437.40 ms，p95=496.97 ms
+- 计时范围：构造 CrossEncoder 输入对、CPU 推理、分数排序；不包含 RRF 召回。
+
+### 三个重点相邻规则失败
+
+| case_id | query | gold | RRF Top3 | Rerank Top3 | RRF gold rank | Rerank gold rank | 救回 |
+|---|---|---|---|---|---:|---:|---|
+| activity_not_active | 页面还说活动没开始，我能不能先拼上？ | ACT-002 | ACT-003 (0.0320); ACT-002 (0.0315); ELG-004 (0.0313) | ACT-002 (0.8458); ACT-003 (0.2091); ELG-004 (0.1941) | 2 | 1 | 是 |
+| joinable_team_conditions | 什么样的别人队伍才会出现在可以加入的列表里？ | TEAM-005 | TEAM-006 (0.0328); TEAM-005 (0.0320); TEAM-008 (0.0310) | TEAM-006 (0.9662); TEAM-005 (0.4675); TEAM-007 (0.3614) | 2 | 2 | 否 |
+| formed_refund_review | 钱付了而且团也成了，我申请退款是不是得人工处理？ | PRE-005 | PRE-006 (0.0318); PRE-005 (0.0309); RFD-001 (0.0306) | PRE-005 (0.9993); PRE-004 (0.9962); PRE-006 (0.9726) | 2 | 1 | 是 |
+
+### Rerank 相对 RRF 救回（正式集 + hard 集）
+
+| case_id | query | gold | RRF top1 | Rerank top1 |
+|---|---|---|---|---|
+| activity_not_active | 页面还说活动没开始，我能不能先拼上？ | ACT-002 | ACT-003 (0.0320) | ACT-002 (0.8458) |
+| participation_count | 同一个活动我到底参加过几回，平台是怎么数的？ | ELG-001 | TEAM-008 (0.0318) | ELG-001 (0.9979) |
+| audience_visibility | 朋友能看到活动入口，我这边完全没有，是人群限制吗？ | ELG-008 | ELG-005 (0.0325) | ELG-008 (0.9987) |
+| new_team_initial_state | 我刚发起拼团，为什么显示只有一个占位，还没人付款？ | TEAM-002 | ORD-006 (0.0323) | TEAM-002 (0.9779) |
+| team_last_slot | 只剩最后一个位置时两个人都点加入，会不会超出人数？ | TEAM-003 | TEAM-007 (0.0323) | TEAM-003 (0.9791) |
+| formed_refund_review | 钱付了而且团也成了，我申请退款是不是得人工处理？ | PRE-005 | PRE-006 (0.0318) | PRE-005 (0.9993) |
+| hard_02 | 我之前跟过一次，后来那单退掉了，这回再参加还算占过次数吗？ | ELG-002 | ELG-003 (0.0328) | ELG-002 (0.9930) |
+| hard_09 | 钱也付了，人也凑齐了，这种情况我还能自己点退，还是得找人处理？ | PRE-005 | RFD-001 (0.0306) | PRE-005 (0.6914) |
+
+### Rerank 相对 RRF 新变差（正式集 + hard 集）
+
+| case_id | query | gold | RRF top1 | Rerank top1 |
+|---|---|---|---|---|
+| order_status_meaning | 订单上的待支付、已完成和已关闭分别代表啥？ | ORD-001 | ORD-001 (0.0320) | ORD-004 (0.9681) |
+| hard_05 | 我刚自己开了一个团，这个团能撑多久，是从我开出来那会儿开始算吗？ | ACT-005 | ACT-005 (0.0318) | TEAM-002 (0.6673) |
+| hard_06 | 这单都已经关掉了，我现在再补个钱还能把它弄回来不？ | ORD-004 | ORD-004 (0.0328) | RFD-002 (0.9719) |
+| hard_08 | 钱我已经付了，但这个团人还没凑齐，我现在想退的话系统能直接给我办吗？ | PRE-004 | PRE-004 (0.0325) | PRE-005 (0.9923) |
+
+### 拒答信号分布（answerable=正式30+hard10，unanswerable=正式10）
+
+| Signal | 类型 | count | min | p25 | median | p75 | max | mean |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Dense cosine | answerable | 40 | 0.5861 | 0.6391 | 0.6939 | 0.7405 | 0.8212 | 0.6924 |
+| Dense cosine | unanswerable | 10 | 0.4163 | 0.5226 | 0.5634 | 0.5988 | 0.6186 | 0.5530 |
+| Rerank score | answerable | 40 | 0.6673 | 0.9757 | 0.9948 | 0.9985 | 0.9997 | 0.9670 |
+| Rerank score | unanswerable | 10 | 0.0003 | 0.0403 | 0.0854 | 0.1519 | 0.7730 | 0.1859 |
+
+### 探索性拒答阈值
+
+| Signal | Threshold | False Reject | False Answer | TPR | TNR | Balanced Accuracy |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense cosine | 0.620182 | 7 | 0 | 0.8250 | 1.0000 | 0.9125 |
+| Rerank score | 0.845828 | 2 | 0 | 0.9500 | 1.0000 | 0.9750 |
+
+> 阈值和指标来自同一小样本集，仅作为 D3 的探索信号，不能视为泛化性能结论。

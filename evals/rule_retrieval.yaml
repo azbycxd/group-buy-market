@@ -72,7 +72,7 @@
   gold_rule_ids: [PRE-001]
 - id: closed_no_new_proposal
   query: "订单都已经关闭了，还能再生成一次退款申请吗？"
-  gold_rule_ids: [PRE-002]
+  gold_rule_ids: [PRE-002, RFD-002]
 - id: unpaid_cancel_proposal
   query: "团还没拼成，我也没付款，现在取消需要人工审核吗？"
   gold_rule_ids: [PRE-003]

@@ -41,6 +41,7 @@ from confirmation_workflow import (
 )
 from outcome import AgentOutcome, OutcomeKind
 from reconciler import reconcile_stuck_actions
+from rag.pipeline import warmup_rule_search_pipeline
 from session_locks import SessionLockRegistry
 from session_ownership import SessionOwnershipStore
 from tools.context import AgentContext
@@ -461,6 +462,14 @@ async def _reconciler_loop() -> None:
             logger.exception("refund_reconcile_failed")
 
 
+async def _warmup_rag(app: FastAPI) -> None:
+    started = time.perf_counter()
+    await asyncio.to_thread(warmup_rule_search_pipeline)
+    latency_ms = (time.perf_counter() - started) * 1000
+    app.state.rag_warmup_latency_ms = latency_ms
+    logger.info("rag_warmup_completed latency_ms=%.2f", latency_ms)
+
+
 def create_app(
     *,
     checkpoint_path: str | Path | None = None,
@@ -484,6 +493,7 @@ def create_app(
         app.state.session_locks = SessionLockRegistry()
         app.state.confirmation_locks = SessionLockRegistry()
         app.state.action_store = AgentActionStore()
+        await _warmup_rag(app)
         app.state.agent = await create_async_order_agent(selected_checkpoint)
         try:
             app.state.confirmation_graph = (

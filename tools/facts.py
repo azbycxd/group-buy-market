@@ -5,6 +5,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
 )
@@ -129,6 +130,7 @@ class RuleMatch(FactsModel):
     rule_id: StrictStr
     title: StrictStr
     content: StrictStr
+    rerank_score: StrictFloat
 
 
 class RuleSearchFacts(FactsModel):
