@@ -511,3 +511,53 @@
   forbidden_tools: [get_activity_facts]
   expected_agent_rounds: 1
   forbidden_claim_terms: ["请提供活动", "活动 ID"]
+
+- id: d3b_hard_08
+  category: 规则答案引用
+  input: "钱已经付了，但是这个团人还没凑齐，我现在想退的话能直接处理吗？"
+  expected_action: ANSWER
+  required_tools: [search_group_buy_rules]
+  required_evidence: [search_group_buy_rules.matches.*]
+  required_rule_ids: [PRE-004]
+  forbidden_claim_terms: ["必须人工审核", "已成团才能处理", "当前已经成团"]
+
+- id: d3b_hard_06
+  category: 规则答案引用
+  input: "这单已经关掉了，我现在再补钱还能把它弄回来吗？"
+  expected_action: ANSWER
+  required_tools: [search_group_buy_rules]
+  required_evidence: [search_group_buy_rules.matches.*]
+  required_rule_ids: [ORD-004]
+  forbidden_claim_terms: ["可以补钱恢复", "可以重新支付"]
+
+- id: d3b_order_status_meaning
+  category: 规则答案引用
+  input: "订单上的待支付、已完成、已关闭分别是什么意思？"
+  expected_action: ANSWER
+  required_tools: [search_group_buy_rules]
+  required_evidence: [search_group_buy_rules.matches.*]
+  required_rule_ids: [ORD-001]
+  forbidden_claim_terms: []
+
+- id: d3b_closed_no_new_proposal
+  category: 规则答案引用
+  input: "订单都已经关闭了，还能再生成一次退款申请吗？"
+  expected_action: ANSWER
+  required_tools: [search_group_buy_rules]
+  required_evidence: [search_group_buy_rules.matches.*]
+  required_rule_ids_any: [PRE-002, RFD-002]
+  forbidden_claim_terms: ["可以再次生成", "可以重复退款"]
+
+- id: d3b_no_rule_points
+  category: 规则答案引用
+  input: "参加拼团会送多少会员积分？"
+  expected_action: HANDOFF
+  forbidden_evidence: [search_group_buy_rules.matches.*]
+  forbidden_claim_terms: ["会送积分", "不送积分", "积分数量"]
+
+- id: d3b_no_rule_return_shipping
+  category: 规则答案引用
+  input: "拼团商品退货时运费由谁承担？"
+  expected_action: HANDOFF
+  forbidden_evidence: [search_group_buy_rules.matches.*]
+  forbidden_claim_terms: ["买家承担", "商家承担", "平台承担", "免运费"]

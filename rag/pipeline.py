@@ -14,7 +14,8 @@ from rag.rerank import CANDIDATE_COUNT, RerankIndex
 
 # Exploratory threshold selected on the small D2.1 evaluation set.
 DEFAULT_RERANK_THRESHOLD = 0.85
-FINAL_MATCH_COUNT = 3
+FINAL_RERANK_COUNT = 3
+FINAL_RRF_COUNT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,11 +71,25 @@ class RuleSearchPipeline:
         reranked = self.reranker.rerank(
             original_utterance,
             merged,
-            top_k=FINAL_MATCH_COUNT,
+            top_k=CANDIDATE_COUNT,
         )
         top_score = reranked[0].score if reranked else None
         matches: tuple[RuleSearchHit, ...] = ()
         if top_score is not None and top_score >= threshold:
+            reranked_by_id = {item.rule_id: item for item in reranked}
+            final_candidates: list[SearchResult] = []
+            seen_rule_ids: set[str] = set()
+            for item in (
+                *reranked[:FINAL_RERANK_COUNT],
+                *merged[:FINAL_RRF_COUNT],
+            ):
+                if item.rule_id in seen_rule_ids:
+                    continue
+                # Every merged Top3 item was scored in the full rerank Top10;
+                # expose its CrossEncoder score, not its RRF fusion score.
+                scored = reranked_by_id[item.rule_id]
+                final_candidates.append(scored)
+                seen_rule_ids.add(item.rule_id)
             matches = tuple(
                 RuleSearchHit(
                     rule_id=item.rule_id,
@@ -82,7 +97,7 @@ class RuleSearchPipeline:
                     content=item.content,
                     rerank_score=item.score,
                 )
-                for item in reranked
+                for item in final_candidates
             )
         return RuleSearchResult(
             matches=matches,

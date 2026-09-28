@@ -30,7 +30,7 @@ class RuleSearchTests(unittest.TestCase):
         schema = search_group_buy_rules.tool_call_schema.model_json_schema()
         self.assertEqual(set(schema["properties"]), {"query"})
 
-    def test_trusted_user_text_drives_rerank_and_top3_is_returned(self) -> None:
+    def test_trusted_user_text_drives_rerank_and_final_pool_is_returned(self) -> None:
         matches = tuple(
             RuleSearchHit(
                 rule_id=f"RULE-{index}",
@@ -38,7 +38,7 @@ class RuleSearchTests(unittest.TestCase):
                 content=f"内容 {index}",
                 rerank_score=0.99 - index / 10,
             )
-            for index in range(3)
+            for index in range(6)
         )
         pipeline = FakePipeline(matches)
         runtime = SimpleNamespace(
@@ -70,7 +70,7 @@ class RuleSearchTests(unittest.TestCase):
             ],
         )
         returned = result["data"]["matches"]
-        self.assertEqual(len(returned), 3)
+        self.assertEqual(len(returned), 6)
         self.assertEqual(
             set(returned[0]),
             {"rule_id", "title", "content", "rerank_score"},

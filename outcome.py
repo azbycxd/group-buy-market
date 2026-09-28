@@ -21,6 +21,10 @@ class Claim(BaseModel):
     text: StrictStr
     type: ClaimType
     evidence: list[StrictStr] = Field(default_factory=list)
+    rule_id: StrictStr | None = Field(
+        default=None,
+        description="RULE Claim 必须填写当前规则检索结果中的 rule_id",
+    )
 
 
 class AgentOutcome(BaseModel):

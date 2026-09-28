@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -85,7 +86,8 @@ OUTCOME_PROMPT = """你是最终回答结构化节点。根据草稿回答和 Ev
 - kind 必须是 ANSWER。
 - 将草稿中的业务事实或规则结论写入 claims。
 - FACT Claim 只能逐字引用清单中 type=FACT 的 path。
-- RULE Claim 只能逐字引用清单中 type=RULE 的 path。
+- RULE Claim 必须填写 rule_id，并且只能使用同一条当前 type=RULE Evidence 中真实存在的 rule_id 和 path。
+- 每条 RULE Claim 只对应一个 rule_id；text 只写规则结论正文，不要自行生成“依据《标题》”引用，标题由程序从 Evidence 重建。
 - 没有对应类型 Evidence 时，不得生成该类型 Claim，必须从最终回答删除该结论。
 - 状态类 FACT 只能陈述查询到的状态；没有 RULE Evidence 时，不得推导该状态对应的业务后果。
 - CAPABILITY Claim 用于能力边界或服务可用性，可以不引用 Evidence。
@@ -195,6 +197,14 @@ def _capability_outcome(kind: OutcomeKind, text: str) -> AgentOutcome:
 
 def _claim_errors(outcome: AgentOutcome, evidence: list[Evidence]) -> list[str]:
     catalog = {item.path: item.type for item in evidence}
+    rule_catalog = {
+        item.path: item.value
+        for item in evidence
+        if item.type is EvidenceType.RULE
+        and isinstance(item.value, dict)
+        and isinstance(item.value.get("rule_id"), str)
+        and isinstance(item.value.get("title"), str)
+    }
     errors: list[str] = []
     for claim in outcome.claims:
         missing_paths = [path for path in claim.evidence if path not in catalog]
@@ -204,7 +214,6 @@ def _claim_errors(outcome: AgentOutcome, evidence: list[Evidence]) -> list[str]:
         if claim.type in {ClaimType.FACT, ClaimType.RULE}:
             if not claim.evidence:
                 errors.append(f"{claim.type.value} Claim 缺少 Evidence")
-                continue
             expected_type = (
                 EvidenceType.FACT
                 if claim.type is ClaimType.FACT
@@ -220,7 +229,65 @@ def _claim_errors(outcome: AgentOutcome, evidence: list[Evidence]) -> list[str]:
                     f"{claim.type.value} Claim 引用了错误类型 Evidence: "
                     f"{', '.join(wrong_type)}"
                 )
+        if claim.type is ClaimType.RULE:
+            if not claim.rule_id:
+                errors.append("RULE Claim 缺少 rule_id")
+                continue
+            matching_paths = {
+                path
+                for path, match in rule_catalog.items()
+                if match["rule_id"] == claim.rule_id
+            }
+            if not matching_paths:
+                errors.append(
+                    f"RULE Claim 的 rule_id 不在本轮检索结果中: {claim.rule_id}"
+                )
+                continue
+            referenced_rule_paths = {
+                path for path in claim.evidence if path in rule_catalog
+            }
+            if not referenced_rule_paths.intersection(matching_paths):
+                errors.append(
+                    "RULE Claim 未引用其 rule_id 对应的 Evidence: "
+                    f"{claim.rule_id}"
+                )
+            foreign_paths = referenced_rule_paths.difference(matching_paths)
+            if foreign_paths:
+                errors.append(
+                    "RULE Claim 引用了其他 rule_id 的 Evidence: "
+                    f"{', '.join(sorted(foreign_paths))}"
+                )
     return errors
+
+
+_MODEL_RULE_CITATION = re.compile(r"^\s*依据《[^》]*》[\s，,：:。]*")
+
+
+def _validated_claims(
+    generated: AgentOutcome,
+    evidence: list[Evidence],
+) -> list[Claim]:
+    rule_matches = {
+        str(item.value["rule_id"]): item.value
+        for item in evidence
+        if item.type is EvidenceType.RULE
+        and isinstance(item.value, dict)
+        and isinstance(item.value.get("rule_id"), str)
+        and isinstance(item.value.get("title"), str)
+    }
+    validated: list[Claim] = []
+    for claim in generated.claims:
+        if claim.type is not ClaimType.RULE:
+            validated.append(claim)
+            continue
+        match = rule_matches[claim.rule_id or ""]
+        body = _MODEL_RULE_CITATION.sub("", claim.text).strip()
+        validated.append(
+            claim.model_copy(
+                update={"text": f"依据《{match['title']}》：{body}"}
+            )
+        )
+    return validated
 
 
 def _validated_answer_outcome(
@@ -235,9 +302,11 @@ def _validated_answer_outcome(
             OutcomeKind.HANDOFF,
             "回答中的结论无法与查询到的事实对应，已转人工客服核实。",
         )
+    claims = _validated_claims(generated, evidence)
     return generated.model_copy(
         update={
-            "final_answer": "\n".join(claim.text for claim in generated.claims)
+            "claims": claims,
+            "final_answer": "\n".join(claim.text for claim in claims),
         }
     )
 

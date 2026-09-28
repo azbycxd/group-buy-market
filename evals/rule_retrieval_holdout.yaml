@@ -1,0 +1,20 @@
+cases:
+  - id: holdout_gift_wrap
+    query: "拼单买来送人，平台能不能帮我包成礼物再寄？"
+    gold_rule_ids: []
+
+  - id: holdout_price_protection
+    query: "我刚拼完就降价了，这种情况能补差价吗？"
+    gold_rule_ids: []
+
+  - id: holdout_store_pickup
+    query: "拼团下单以后可以不发快递，直接到门店自提吗？"
+    gold_rule_ids: []
+
+  - id: holdout_warranty
+    query: "这个拼来的商品坏了，保修期到底有多久？"
+    gold_rule_ids: []
+
+  - id: holdout_installation
+    query: "买这个拼团商品以后有人上门安装吗，安装费怎么算？"
+    gold_rule_ids: []

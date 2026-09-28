@@ -39,6 +39,8 @@ class EvalRun:
     understanding: list[str]
     rule_queries: list[str]
     rule_matches: list[dict[str, Any]]
+    rule_claims: list[dict[str, Any]]
+    final_answer: str
     token_count: int
     latency_seconds: float
     reasons: list[str]
@@ -242,6 +244,17 @@ def evaluate_result(
     evidence = result.get("evidence", [])
     evidence_paths = [item.path for item in evidence]
     evidence_types = {item.path: item.type for item in evidence}
+    current_rule_matches = {
+        str(item.value["rule_id"]): {
+            "path": item.path,
+            **item.value,
+        }
+        for item in evidence
+        if item.type is EvidenceType.RULE
+        and isinstance(item.value, dict)
+        and isinstance(item.value.get("rule_id"), str)
+        and isinstance(item.value.get("title"), str)
+    }
     understanding = result.get("understanding")
     understanding_needs = [
         getattr(need, "value", str(need))
@@ -400,6 +413,59 @@ def evaluate_result(
                         f"{', '.join(wrong_type)}"
                     )
 
+        rule_claims = [
+            claim for claim in outcome.claims if claim.type is ClaimType.RULE
+        ]
+        claimed_rule_ids = {
+            claim.rule_id for claim in rule_claims if claim.rule_id
+        }
+        required_rule_ids = set(case.get("required_rule_ids", []))
+        missing_rule_ids = sorted(required_rule_ids.difference(claimed_rule_ids))
+        if missing_rule_ids:
+            reasons.append(
+                f"RULE Claim 缺少要求 rule_id: {', '.join(missing_rule_ids)}"
+            )
+        required_rule_ids_any = set(case.get("required_rule_ids_any", []))
+        if required_rule_ids_any and not required_rule_ids_any.intersection(
+            claimed_rule_ids
+        ):
+            reasons.append(
+                "RULE Claim 未命中任一允许 rule_id: "
+                + ", ".join(sorted(required_rule_ids_any))
+            )
+        forbidden_rule_ids = sorted(
+            set(case.get("forbidden_rule_ids", [])).intersection(
+                claimed_rule_ids
+            )
+        )
+        if forbidden_rule_ids:
+            reasons.append(
+                f"RULE Claim 命中禁用 rule_id: {', '.join(forbidden_rule_ids)}"
+            )
+
+        for claim in rule_claims:
+            if not claim.rule_id:
+                reasons.append("RULE Claim 缺少 rule_id")
+                continue
+            match = current_rule_matches.get(claim.rule_id)
+            if match is None:
+                reasons.append(
+                    f"RULE Claim rule_id 不在本轮 Tool match: {claim.rule_id}"
+                )
+                continue
+            if match["path"] not in claim.evidence:
+                reasons.append(
+                    "RULE Claim 未引用本轮对应 match Evidence: "
+                    f"{claim.rule_id}"
+                )
+            citation = f"依据《{match['title']}》"
+            if citation not in claim.text or citation not in outcome.final_answer:
+                reasons.append(
+                    f"最终回答缺少真实标题引用: {claim.rule_id}"
+                )
+    else:
+        rule_claims = []
+
     expected_agent_rounds = case.get("expected_agent_rounds")
     if (
         expected_agent_rounds is not None
@@ -418,6 +484,8 @@ def evaluate_result(
         understanding=understanding_needs,
         rule_queries=rule_queries,
         rule_matches=rule_matches,
+        rule_claims=[claim.model_dump(mode="json") for claim in rule_claims],
+        final_answer=outcome.final_answer if outcome is not None else "",
         token_count=token_count,
         latency_seconds=latency_seconds,
         reasons=reasons,
@@ -574,6 +642,8 @@ def main() -> None:
                             understanding=[],
                             rule_queries=[],
                             rule_matches=[],
+                            rule_claims=[],
+                            final_answer="",
                             token_count=0,
                             latency_seconds=time.perf_counter() - started_at,
                             reasons=[f"运行异常: {type(error).__name__}"],
@@ -600,7 +670,9 @@ def main() -> None:
                                     "search_group_buy_rules" in run.tools
                                 ),
                                 "matches": run.rule_matches,
+                                "rule_claims": run.rule_claims,
                                 "outcome": run.actual_action,
+                                "final_answer": run.final_answer,
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),

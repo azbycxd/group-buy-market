@@ -43,11 +43,12 @@ class FakeReranker:
     ) -> list[SearchResult]:
         self.query = query
         self.candidate_ids = [item.rule_id for item in candidates]
-        scores = [self.top_score, 0.8, 0.7]
+        scores = [self.top_score - 0.01 * index for index in range(top_k)]
+        reranked = list(reversed(candidates[:top_k]))
         return [
             _result(candidate.rule_id, score)
             for candidate, score in zip(
-                candidates[:top_k], scores, strict=True
+                reranked, scores, strict=True
             )
         ]
 
@@ -77,8 +78,15 @@ def test_dual_query_merge_and_original_utterance_rerank() -> None:
     ]
     assert pipeline.reranker.query == "用户原话"
     assert len(pipeline.reranker.candidate_ids) == 10
-    assert len(result.matches) == 3
+    assert len(result.matches) == 6
+    assert [item.rule_id for item in result.matches[:3]] == list(
+        reversed(pipeline.reranker.candidate_ids)
+    )[:3]
+    assert [item.rule_id for item in result.matches[3:]] == (
+        pipeline.reranker.candidate_ids[:3]
+    )
     assert result.matches[0].rerank_score == 0.9
+    assert result.matches[3].rerank_score < result.matches[2].rerank_score
 
 
 def test_rerank_score_below_threshold_returns_no_matches() -> None:

@@ -28,8 +28,12 @@ DEFAULT_CASES_PATH = PROJECT_ROOT / "evals" / "rule_retrieval.yaml"
 DEFAULT_HARD_CASES_PATH = (
     PROJECT_ROOT / "evals" / "rule_retrieval_hard.yaml"
 )
+DEFAULT_HOLDOUT_CASES_PATH = (
+    PROJECT_ROOT / "evals" / "rule_retrieval_holdout.yaml"
+)
 DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "rag_eval.md"
 METHODS = ("BM25", "Dense", "RRF", "RRF+Rerank")
+RUNTIME_RERANK_THRESHOLD = 0.85
 FOCUS_CASE_IDS = (
     "activity_not_active",
     "joinable_team_conditions",
@@ -430,6 +434,67 @@ def build_d21_report(
     return "\n".join(lines)
 
 
+def build_d3b_threshold_report(
+    *,
+    holdout: list[CaseResult],
+    hard: list[CaseResult],
+) -> str:
+    false_answers = sum(
+        result.results[0].score >= RUNTIME_RERANK_THRESHOLD
+        for result in holdout
+    )
+    false_rejects = sum(
+        result.results[0].score < RUNTIME_RERANK_THRESHOLD
+        for result in hard
+    )
+    lines = [
+        "## D3b 固定阈值盲测",
+        "",
+        (
+            f"固定 `RAG_RERANK_THRESHOLD={RUNTIME_RERANK_THRESHOLD}`；"
+            "本节只评测，不据此修改阈值、规则、query 或模型。"
+        ),
+        "",
+        "### Holdout unanswerable（5 条）",
+        "",
+        "| case_id | Top1 rule | score | decision |",
+        "|---|---|---:|---|",
+    ]
+    for result in holdout:
+        top = result.results[0]
+        accepted = top.score >= RUNTIME_RERANK_THRESHOLD
+        lines.append(
+            f"| {result.case.case_id} | {top.rule_id} | {top.score:.6f} | "
+            f"{'accepted' if accepted else 'rejected'} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"False Answer：**{false_answers}/{len(holdout)}**",
+            "",
+            "### Hard answerable（10 条）",
+            "",
+            "| case_id | Top1 rule | score | decision |",
+            "|---|---|---:|---|",
+        ]
+    )
+    for result in hard:
+        top = result.results[0]
+        accepted = top.score >= RUNTIME_RERANK_THRESHOLD
+        lines.append(
+            f"| {result.case.case_id} | {top.rule_id} | {top.score:.6f} | "
+            f"{'accepted' if accepted else 'rejected'} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"False Reject：**{false_rejects}/{len(hard)}**",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _validate_gold(
     cases: list[RetrievalCase], known_rule_ids: set[str]
 ) -> None:
@@ -458,6 +523,9 @@ def main() -> None:
     parser.add_argument(
         "--hard-cases", type=Path, default=DEFAULT_HARD_CASES_PATH
     )
+    parser.add_argument(
+        "--holdout-cases", type=Path, default=DEFAULT_HOLDOUT_CASES_PATH
+    )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--k1", type=float, default=1.5)
     parser.add_argument("--b", type=float, default=0.75)
@@ -468,8 +536,11 @@ def main() -> None:
     chunks = load_rule_chunks(arguments.rules)
     formal_cases = load_cases(arguments.cases)
     hard_cases = load_cases(arguments.hard_cases)
+    holdout_cases = load_cases(arguments.holdout_cases)
+    if any(case.answerable for case in holdout_cases):
+        raise ValueError("Holdout 阈值评测必须全部是 unanswerable Case")
     known_rule_ids = {chunk.rule_id for chunk in chunks}
-    _validate_gold(formal_cases + hard_cases, known_rule_ids)
+    _validate_gold(formal_cases + hard_cases + holdout_cases, known_rule_ids)
 
     bm25_index = BM25Index(chunks, k1=arguments.k1, b=arguments.b)
     dense_index = DenseIndex(
@@ -501,6 +572,7 @@ def main() -> None:
         method: evaluate(index, hard_cases)
         for method, index in indexes.items()
     }
+    holdout_rerank = evaluate(rerank_index, holdout_cases)
     formal = {
         method: [result for result in results if result.case.answerable]
         for method, results in formal_all.items()
@@ -539,6 +611,10 @@ def main() -> None:
         signals=signals,
         thresholds=thresholds,
         latencies_ms=rerank_index.latencies_ms,
+    )
+    report += "\n" + build_d3b_threshold_report(
+        holdout=holdout_rerank,
+        hard=hard_all["RRF+Rerank"],
     )
 
     arguments.report.parent.mkdir(parents=True, exist_ok=True)

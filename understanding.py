@@ -106,6 +106,26 @@ _BARE_PENDING_NUMERIC_ORDER = re.compile(
 _ACTIVITY_ID = re.compile(
     r"(?<![A-Za-z0-9._-])(?:活动\s*)?([0-9]+)(?![A-Za-z0-9._-])"
 )
+_EXPLICIT_REFUND_ACTION = re.compile(
+    r"(?:^|[，,。.!！?？])\s*(?:请\s*)?(?:直接\s*)?"
+    r"(?:(?:帮|替|给)我.{0,10}(?:退掉|退款|办理退款)|"
+    r"(?:给|为)(?:订单|这单).{0,12}(?:退款|退掉|办理)|"
+    r"(?:立即|马上)?(?:发起|办理|执行)退款)"
+)
+_RULE_QUESTION_MARKER = re.compile(
+    r"能不能|能否|是否可以|可不可以|会不会|是否需要|需不需要|"
+    r"是不是|是什么意思|什么情况下|还能|能.{0,12}[吗么?？]"
+)
+_BUSINESS_RULE_TOPIC = re.compile(
+    r"订单|这单|这笔|待支付|已完成|已关闭|关闭|关掉|付款|支付|"
+    r"付了|补钱|退款|退单|退|成团|未成团|凑齐|人工审核|"
+    r"活动|参团|资格|次数|团队|队伍|拼团"
+)
+_RULE_ACTION_OR_MEANING = re.compile(
+    r"退(?:款|单|掉)?|补钱|重新付款|继续付款|恢复|弄回来|"
+    r"生成.{0,6}申请|人工审核|是什么意思|含义|什么情况下"
+)
+_REFUND_RULE_TOPIC = re.compile(r"退(?:款|单|掉)?|退款申请|人工审核")
 
 
 def _resolve_order_match(
@@ -226,6 +246,29 @@ def resolve_pending_entities(
     return parsed
 
 
+def normalize_rule_question(
+    user_text: str,
+    understanding: Understanding,
+    parsed_entities: list[ParsedEntity],
+) -> Understanding:
+    """Normalize generic rule questions without overriding concrete operations."""
+    if parsed_entities or _EXPLICIT_REFUND_ACTION.search(user_text):
+        return understanding
+    if not _BUSINESS_RULE_TOPIC.search(user_text):
+        return understanding
+    if not _RULE_QUESTION_MARKER.search(user_text):
+        return understanding
+    if not _RULE_ACTION_OR_MEANING.search(user_text):
+        return understanding
+
+    need = (
+        InformationNeed.REFUND_POLICY
+        if _REFUND_RULE_TOPIC.search(user_text)
+        else InformationNeed.RULE_EXPLANATION
+    )
+    return understanding.model_copy(update={"needs": [need]})
+
+
 def create_understander(model: Any) -> Any:
     return model.with_structured_output(
         Understanding,
@@ -245,4 +288,9 @@ def understand_text(
         ]
     )
     parsed_entities = resolve_entities(user_text, understanding.entities)
+    understanding = normalize_rule_question(
+        user_text,
+        understanding,
+        parsed_entities,
+    )
     return understanding, parsed_entities
