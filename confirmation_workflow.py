@@ -15,9 +15,9 @@ from tools.facts import OrderFacts
 from tools.facts_client import query_facts
 from tools.refund_execute import (
     ExecutionCertainty,
-    RefundExecutionResult,
     execute_refund,
 )
+from tools.refund_result import query_refund_result
 
 
 class ConfirmationState(TypedDict, total=False):
@@ -29,6 +29,7 @@ class ConfirmationState(TypedDict, total=False):
     execution_certainty: str
     result_code: str
     retry_count: int
+    result_query_count: int
     final_status: str
     message: str
     error: str
@@ -160,9 +161,28 @@ def _result_message(
             "订单关闭不代表支付渠道资金已经到账。"
         )
     return (
-        "退款结果暂时无法确认；已使用原幂等键完成一次对账重试，"
-        "当前保持 UNKNOWN，请稍后查询。"
+        "退款结果暂时无法确认，正在等待后续对账。"
     )
+
+
+def _refund_result_message(
+    *,
+    status: ActionStatus,
+    result_code: str,
+) -> str:
+    if status is ActionStatus.SUCCEEDED:
+        return (
+            f"退款操作已完成（{result_code}）。"
+            "退款执行成功不代表支付渠道资金已经到账。"
+        )
+    if status is ActionStatus.FAILED:
+        if result_code == "NOT_RECEIVED_BEFORE_QUERY":
+            return (
+                "退款请求没有送达，本次没有执行退款，"
+                "请重新发起退款提议。"
+            )
+        return f"本次退款未执行（{result_code}），请重新发起退款提议。"
+    return "退款结果暂时无法确认，正在等待后续对账。"
 
 
 def _compile_confirmation_graph(checkpointer: object):
@@ -301,25 +321,25 @@ def _compile_confirmation_graph(checkpointer: object):
                 "retry_count": 0,
             }
 
-        retry_result: RefundExecutionResult = execute_refund(
+        result_query = query_refund_result(
             action,
             request_id=request_id,
         )
-        if retry_result.certainty is ExecutionCertainty.SUCCESS:
+        if result_query.certainty is ExecutionCertainty.SUCCESS:
             result = _finish(
                 store,
                 action,
                 ActionStatus.SUCCEEDED,
-                retry_result.result_code,
-                retry_result.refund_executed,
+                result_query.result_code,
+                result_query.refund_executed,
             )
-        elif retry_result.certainty is ExecutionCertainty.FAILURE:
+        elif result_query.certainty is ExecutionCertainty.FAILURE:
             result = _finish(
                 store,
                 action,
                 ActionStatus.FAILED,
-                retry_result.result_code,
-                retry_result.refund_executed,
+                result_query.result_code,
+                result_query.refund_executed,
             )
         else:
             result = {
@@ -327,19 +347,13 @@ def _compile_confirmation_graph(checkpointer: object):
                 "action_version": int(action["version"]),
             }
 
-        latest = store.get_action(state["action_id"]) or action
-        determined, order_status = _order_status(
-            latest,
-            request_id=request_id,
-        )
         final_status = ActionStatus(str(result["final_status"]))
-        result["message"] = _result_message(
+        result["message"] = _refund_result_message(
             status=final_status,
-            result_code=retry_result.result_code,
-            facts_determined=determined,
-            order_status=order_status,
+            result_code=result_query.result_code,
         )
-        result["retry_count"] = 1
+        result["retry_count"] = 0
+        result["result_query_count"] = 1
         return result
 
     graph = StateGraph(ConfirmationState)

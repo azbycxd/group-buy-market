@@ -119,6 +119,12 @@ class RefundExecutionFacts(FactsModel):
     idempotent_replay: StrictBool = Field(alias="idempotentReplay")
 
 
+class RefundResultFacts(FactsModel):
+    status: Literal["SUCCEEDED", "FAILED", "ABANDONED", "PROCESSING"]
+    result_code: StrictStr = Field(alias="resultCode")
+    refund_executed: StrictBool = Field(alias="refundExecuted")
+
+
 class RuleMatch(FactsModel):
     rule_id: StrictStr
     title: StrictStr

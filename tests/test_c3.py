@@ -77,14 +77,21 @@ class C3RefundWorkflowTests(unittest.TestCase):
         action: dict[str, object],
         *,
         execute_side_effect: list[RefundExecutionResult],
+        result_side_effect: list[RefundExecutionResult],
         facts_side_effect: list[tuple[bool, str | None]],
-    ) -> tuple[dict[str, object], list[str]]:
-        observed_keys: list[str] = []
+    ) -> tuple[dict[str, object], list[str], list[str]]:
+        observed_write_keys: list[str] = []
+        observed_result_keys: list[str] = []
 
         def execute(current, *, request_id=""):
             del request_id
-            observed_keys.append(str(current["idempotency_key"]))
+            observed_write_keys.append(str(current["idempotency_key"]))
             return execute_side_effect.pop(0)
+
+        def query_result(current, *, request_id=""):
+            del request_id
+            observed_result_keys.append(str(current["idempotency_key"]))
+            return result_side_effect.pop(0)
 
         connection = sqlite3.connect(
             self.checkpoint_path,
@@ -96,6 +103,10 @@ class C3RefundWorkflowTests(unittest.TestCase):
                 patch(
                     "confirmation_workflow.execute_refund",
                     side_effect=execute,
+                ),
+                patch(
+                    "confirmation_workflow.query_refund_result",
+                    side_effect=query_result,
                 ),
                 patch(
                     "confirmation_workflow._order_status",
@@ -113,11 +124,11 @@ class C3RefundWorkflowTests(unittest.TestCase):
                 )
         finally:
             connection.close()
-        return result, observed_keys
+        return result, observed_write_keys, observed_result_keys
 
     def test_explicit_failure_and_close_stays_failed(self) -> None:
         action = self.create_action()
-        result, keys = self.resume(
+        result, write_keys, result_keys = self.resume(
             action,
             execute_side_effect=[
                 RefundExecutionResult(
@@ -126,6 +137,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     result_code="BUSINESS_REJECTED",
                 )
             ],
+            result_side_effect=[],
             facts_side_effect=[(True, "CLOSE")],
         )
         current = self.store.get_action(str(action["action_id"]))
@@ -135,17 +147,20 @@ class C3RefundWorkflowTests(unittest.TestCase):
         self.assertEqual(current["result_code"], "BUSINESS_REJECTED")
         self.assertEqual(current["refund_executed"], 0)
         self.assertIn("订单已经是关闭状态，本次没有重复退款", result["message"])
-        self.assertEqual(keys, [action["idempotency_key"]])
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [])
 
-    def test_timeout_retries_once_with_same_key_then_succeeds(self) -> None:
+    def test_timeout_queries_result_once_then_succeeds(self) -> None:
         action = self.create_action()
-        result, keys = self.resume(
+        result, write_keys, result_keys = self.resume(
             action,
             execute_side_effect=[
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.UNKNOWN,
                     result_code="REQUEST_TIMEOUT",
-                ),
+                )
+            ],
+            result_side_effect=[
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.SUCCESS,
                     status="SUCCEEDED",
@@ -154,44 +169,105 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     idempotent_replay=True,
                 ),
             ],
-            facts_side_effect=[(True, "CLOSE")],
+            facts_side_effect=[],
         )
         current = self.store.get_action(str(action["action_id"]))
         self.assertEqual(result["final_status"], "SUCCEEDED")
-        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["retry_count"], 0)
+        self.assertEqual(result["result_query_count"], 1)
         self.assertEqual(current["version"], 5)
         self.assertEqual(current["result_code"], "REFUND_SUCCEEDED")
         self.assertEqual(current["refund_executed"], 1)
-        self.assertEqual(keys, [action["idempotency_key"]] * 2)
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [action["idempotency_key"]])
 
-    def test_persistent_uncertainty_stops_after_one_retry(self) -> None:
+    def test_processing_result_stays_unknown_without_write_retry(self) -> None:
         action = self.create_action()
-        result, keys = self.resume(
+        result, write_keys, result_keys = self.resume(
             action,
             execute_side_effect=[
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.UNKNOWN,
                     result_code="REQUEST_TIMEOUT",
-                ),
+                )
+            ],
+            result_side_effect=[
                 RefundExecutionResult(
                     certainty=ExecutionCertainty.UNKNOWN,
-                    result_code="REQUEST_TIMEOUT",
+                    status="PROCESSING",
+                    result_code="REFUND_PROCESSING",
                 ),
             ],
-            facts_side_effect=[(True, "NORMAL")],
+            facts_side_effect=[],
         )
         current = self.store.get_action(str(action["action_id"]))
         self.assertEqual(result["final_status"], "UNKNOWN")
-        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["retry_count"], 0)
+        self.assertEqual(result["result_query_count"], 1)
         self.assertEqual(current["status"], "UNKNOWN")
         self.assertEqual(current["version"], 4)
         self.assertEqual(current["result_code"], "REQUEST_TIMEOUT")
         self.assertIsNone(current["refund_executed"])
-        self.assertEqual(keys, [action["idempotency_key"]] * 2)
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [action["idempotency_key"]])
+        self.assertIn("等待后续对账", result["message"])
+
+    def test_result_query_timeout_stays_unknown_without_write_retry(self) -> None:
+        action = self.create_action()
+        result, write_keys, result_keys = self.resume(
+            action,
+            execute_side_effect=[
+                RefundExecutionResult(
+                    certainty=ExecutionCertainty.UNKNOWN,
+                    result_code="REQUEST_TIMEOUT",
+                )
+            ],
+            result_side_effect=[
+                RefundExecutionResult(
+                    certainty=ExecutionCertainty.UNKNOWN,
+                    result_code="RESULT_QUERY_TIMEOUT",
+                )
+            ],
+            facts_side_effect=[],
+        )
+        current = self.store.get_action(str(action["action_id"]))
+        self.assertEqual(result["final_status"], "UNKNOWN")
+        self.assertEqual(current["status"], "UNKNOWN")
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [action["idempotency_key"]])
+
+    def test_not_received_result_fails_with_stable_message(self) -> None:
+        action = self.create_action()
+        result, write_keys, result_keys = self.resume(
+            action,
+            execute_side_effect=[
+                RefundExecutionResult(
+                    certainty=ExecutionCertainty.UNKNOWN,
+                    result_code="REQUEST_TIMEOUT",
+                )
+            ],
+            result_side_effect=[
+                RefundExecutionResult(
+                    certainty=ExecutionCertainty.FAILURE,
+                    status="ABANDONED",
+                    result_code="NOT_RECEIVED_BEFORE_QUERY",
+                    refund_executed=False,
+                )
+            ],
+            facts_side_effect=[],
+        )
+        current = self.store.get_action(str(action["action_id"]))
+        self.assertEqual(result["final_status"], "FAILED")
+        self.assertEqual(current["status"], "FAILED")
+        self.assertEqual(current["result_code"], "NOT_RECEIVED_BEFORE_QUERY")
+        self.assertEqual(current["refund_executed"], 0)
+        self.assertIn("退款请求没有送达", result["message"])
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [action["idempotency_key"]])
 
     def test_version_changed_without_close_fails(self) -> None:
         action = self.create_action()
-        result, keys = self.resume(
+        result, write_keys, result_keys = self.resume(
             action,
             execute_side_effect=[
                 RefundExecutionResult(
@@ -200,6 +276,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     result_code="VERSION_CHANGED",
                 )
             ],
+            result_side_effect=[],
             facts_side_effect=[(True, "NORMAL")],
         )
         current = self.store.get_action(str(action["action_id"]))
@@ -209,11 +286,12 @@ class C3RefundWorkflowTests(unittest.TestCase):
         self.assertEqual(current["result_code"], "VERSION_CHANGED")
         self.assertEqual(current["refund_executed"], 0)
         self.assertIn("重新发起", result["message"])
-        self.assertEqual(keys, [action["idempotency_key"]])
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [])
 
     def test_success_is_terminal_when_facts_query_fails(self) -> None:
         action = self.create_action()
-        result, keys = self.resume(
+        result, write_keys, result_keys = self.resume(
             action,
             execute_side_effect=[
                 RefundExecutionResult(
@@ -223,6 +301,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     refund_executed=True,
                 )
             ],
+            result_side_effect=[],
             facts_side_effect=[(False, None)],
         )
         current = self.store.get_action(str(action["action_id"]))
@@ -231,12 +310,13 @@ class C3RefundWorkflowTests(unittest.TestCase):
         self.assertEqual(current["result_code"], "REFUND_SUCCEEDED")
         self.assertEqual(current["refund_executed"], 1)
         self.assertIn("暂时无法查询最新订单状态", result["message"])
-        self.assertEqual(keys, [action["idempotency_key"]])
+        self.assertEqual(write_keys, [action["idempotency_key"]])
+        self.assertEqual(result_keys, [])
 
     def test_two_sessions_same_order_have_distinct_terminal_results(self) -> None:
         first = self.create_action(session_id=f"c3-first-{uuid.uuid4().hex}")
         second = self.create_action(session_id=f"c3-second-{uuid.uuid4().hex}")
-        first_result, first_keys = self.resume(
+        first_result, first_write_keys, first_result_keys = self.resume(
             first,
             execute_side_effect=[
                 RefundExecutionResult(
@@ -246,9 +326,10 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     refund_executed=True,
                 )
             ],
+            result_side_effect=[],
             facts_side_effect=[(True, "CLOSE")],
         )
-        second_result, second_keys = self.resume(
+        second_result, second_write_keys, second_result_keys = self.resume(
             second,
             execute_side_effect=[
                 RefundExecutionResult(
@@ -258,6 +339,7 @@ class C3RefundWorkflowTests(unittest.TestCase):
                     refund_executed=False,
                 )
             ],
+            result_side_effect=[],
             facts_side_effect=[(True, "CLOSE")],
         )
         first_action = self.store.get_action(str(first["action_id"]))
@@ -271,8 +353,10 @@ class C3RefundWorkflowTests(unittest.TestCase):
             second_result["message"],
         )
         self.assertNotIn("退款失败", second_result["message"])
-        self.assertEqual(first_keys, [first["idempotency_key"]])
-        self.assertEqual(second_keys, [second["idempotency_key"]])
+        self.assertEqual(first_write_keys, [first["idempotency_key"]])
+        self.assertEqual(second_write_keys, [second["idempotency_key"]])
+        self.assertEqual(first_result_keys, [])
+        self.assertEqual(second_result_keys, [])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from tools.facts import (
     OrderFacts,
     RefundExecutionFacts,
     RefundPreviewFacts,
+    RefundResultFacts,
     UserEligibilityFacts,
 )
 
@@ -34,6 +35,10 @@ class RefundExecuteRequest(BaseModel):
     idempotencyKey: str
     expectedVersion: str
     expectedRefundType: str
+
+
+class RefundResultRequest(BaseModel):
+    idempotencyKey: str
 
 
 UserHeader = Annotated[
@@ -138,6 +143,7 @@ REFUND_PREVIEWS: dict[str, dict[str, Any]] = {
 
 
 REFUND_EXECUTIONS: dict[str, dict[str, Any]] = {}
+REFUND_EXECUTION_OWNERS: dict[str, str] = {}
 
 
 ACTIVITIES: dict[int, dict[str, Any]] = {
@@ -361,6 +367,20 @@ async def execute_refund(
 
     previous = REFUND_EXECUTIONS.get(request.idempotencyKey)
     if previous is not None:
+        if REFUND_EXECUTION_OWNERS.get(request.idempotencyKey) != user_id:
+            return delayed_response(
+                business_error("REFUND_RESULT_NOT_FOUND", "退款结果不存在")
+            )
+        if previous["status"] == "ABANDONED":
+            replay = {
+                "status": "FAILED",
+                "resultCode": "ABANDONED",
+                "refundExecuted": False,
+                "idempotentReplay": True,
+            }
+            return delayed_response(
+                success(RefundExecutionFacts.model_validate(replay))
+            )
         replay = {**previous, "idempotentReplay": True}
         return delayed_response(
             success(RefundExecutionFacts.model_validate(replay))
@@ -403,8 +423,39 @@ async def execute_refund(
             "idempotentReplay": False,
         }
     REFUND_EXECUTIONS[request.idempotencyKey] = result
+    REFUND_EXECUTION_OWNERS[request.idempotencyKey] = str(user_id)
     return delayed_response(
         success(RefundExecutionFacts.model_validate(result))
+    )
+
+
+@app.post("/api/v1/agent/order/refund/result")
+async def get_refund_result(
+    request: RefundResultRequest,
+    user_id: UserHeader = None,
+) -> Any:
+    if error := auth_error(user_id):
+        return delayed_response(error)
+    previous = REFUND_EXECUTIONS.get(request.idempotencyKey)
+    if previous is None:
+        previous = {
+            "status": "ABANDONED",
+            "resultCode": "NOT_RECEIVED_BEFORE_QUERY",
+            "refundExecuted": False,
+        }
+        REFUND_EXECUTIONS[request.idempotencyKey] = previous
+        REFUND_EXECUTION_OWNERS[request.idempotencyKey] = str(user_id)
+    elif REFUND_EXECUTION_OWNERS.get(request.idempotencyKey) != user_id:
+        return delayed_response(
+            business_error("REFUND_RESULT_NOT_FOUND", "退款结果不存在")
+        )
+    result = {
+        "status": previous["status"],
+        "resultCode": previous["resultCode"],
+        "refundExecuted": previous["refundExecuted"],
+    }
+    return delayed_response(
+        success(RefundResultFacts.model_validate(result))
     )
 
 
