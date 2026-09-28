@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import os
+import platform
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+import numpy as np
 import yaml
 
 from rag.bm25 import BM25Index, SearchResult
 from rag.chunking import DEFAULT_RULES_PATH, RuleChunk, load_rule_chunks
-from rag.dense import DEFAULT_CACHE_DIR, MODEL_NAME, DenseIndex
+from rag.dense import DEFAULT_CACHE_DIR, MODEL_NAME as DENSE_MODEL_NAME, DenseIndex
 from rag.fusion import RRFIndex
+from rag.rerank import (
+    CANDIDATE_COUNT as RERANK_CANDIDATE_COUNT,
+    MODEL_NAME as RERANK_MODEL_NAME,
+    RerankIndex,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +29,7 @@ DEFAULT_HARD_CASES_PATH = (
     PROJECT_ROOT / "evals" / "rule_retrieval_hard.yaml"
 )
 DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "rag_eval.md"
+METHODS = ("BM25", "Dense", "RRF", "RRF+Rerank")
 FOCUS_CASE_IDS = (
     "activity_not_active",
     "joinable_team_conditions",
@@ -50,6 +59,16 @@ class CaseResult:
     case: RetrievalCase
     results: tuple[SearchResult, ...]
     first_gold_rank: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdResult:
+    threshold: float
+    false_reject: int
+    false_answer: int
+    true_positive_rate: float
+    true_negative_rate: float
+    balanced_accuracy: float
 
 
 def load_cases(path: str | Path) -> list[RetrievalCase]:
@@ -115,35 +134,27 @@ def metrics(results: list[CaseResult]) -> dict[str, float]:
     if not results:
         raise ValueError("指标至少需要一条 Case")
     return {
-        "Recall@1": sum(
+        f"Recall@{at}": sum(
             result.first_gold_rank is not None
-            and result.first_gold_rank <= 1
+            and result.first_gold_rank <= at
             for result in results
         )
-        / len(results),
-        "Recall@3": sum(
-            result.first_gold_rank is not None
-            and result.first_gold_rank <= 3
-            for result in results
-        )
-        / len(results),
-        "Recall@5": sum(
-            result.first_gold_rank is not None
-            and result.first_gold_rank <= 5
-            for result in results
-        )
-        / len(results),
+        / len(results)
+        for at in (1, 3, 5)
+    } | {
         "MRR": statistics.fmean(
             0.0
             if result.first_gold_rank is None
             else 1 / result.first_gold_rank
             for result in results
-        ),
+        )
     }
 
 
 def _percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
+    if not ordered:
+        raise ValueError("百分位至少需要一个值")
     if len(ordered) == 1:
         return ordered[0]
     position = (len(ordered) - 1) * fraction
@@ -167,6 +178,42 @@ def score_distribution(values: list[float]) -> dict[str, float]:
     }
 
 
+def select_threshold(
+    answerable_scores: list[float],
+    unanswerable_scores: list[float],
+) -> ThresholdResult:
+    if not answerable_scores or not unanswerable_scores:
+        raise ValueError("阈值探索需要 answerable 和 unanswerable 样本")
+    all_scores = answerable_scores + unanswerable_scores
+    candidates = sorted(set(all_scores))
+    candidates.append(float(np.nextafter(max(all_scores), np.inf)))
+    selections: list[ThresholdResult] = []
+    for threshold in candidates:
+        false_reject = sum(score < threshold for score in answerable_scores)
+        false_answer = sum(score >= threshold for score in unanswerable_scores)
+        tpr = 1 - false_reject / len(answerable_scores)
+        tnr = 1 - false_answer / len(unanswerable_scores)
+        selections.append(
+            ThresholdResult(
+                threshold=threshold,
+                false_reject=false_reject,
+                false_answer=false_answer,
+                true_positive_rate=tpr,
+                true_negative_rate=tnr,
+                balanced_accuracy=(tpr + tnr) / 2,
+            )
+        )
+    return max(
+        selections,
+        key=lambda item: (
+            item.balanced_accuracy,
+            -item.false_answer,
+            -item.false_reject,
+            item.threshold,
+        ),
+    )
+
+
 def _method_table(
     evaluations: dict[str, list[CaseResult]],
 ) -> list[str]:
@@ -174,7 +221,7 @@ def _method_table(
         "| Method | Recall@1 | Recall@3 | Recall@5 | MRR |",
         "|---|---:|---:|---:|---:|",
     ]
-    for method in ("BM25", "Dense", "RRF"):
+    for method in METHODS:
         values = metrics(evaluations[method])
         lines.append(
             f"| {method} | {values['Recall@1']:.4f} | "
@@ -185,23 +232,41 @@ def _method_table(
 
 
 def _distribution_table(
-    answerable_scores: list[float],
-    unanswerable_scores: list[float],
+    signals: dict[str, tuple[list[float], list[float]]],
 ) -> list[str]:
     lines = [
-        "| 类型 | count | min | p25 | median | p75 | max | mean |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Signal | 类型 | count | min | p25 | median | p75 | max | mean |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for label, scores in (
-        ("answerable", answerable_scores),
-        ("unanswerable", unanswerable_scores),
-    ):
-        values = score_distribution(scores)
+    for signal, (answerable, unanswerable) in signals.items():
+        for label, scores in (
+            ("answerable", answerable),
+            ("unanswerable", unanswerable),
+        ):
+            values = score_distribution(scores)
+            lines.append(
+                f"| {signal} | {label} | {int(values['count'])} | "
+                f"{values['min']:.4f} | {values['p25']:.4f} | "
+                f"{values['median']:.4f} | {values['p75']:.4f} | "
+                f"{values['max']:.4f} | {values['mean']:.4f} |"
+            )
+    return lines
+
+
+def _threshold_table(
+    thresholds: dict[str, ThresholdResult],
+) -> list[str]:
+    lines = [
+        "| Signal | Threshold | False Reject | False Answer | TPR | TNR | Balanced Accuracy |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for signal, result in thresholds.items():
         lines.append(
-            f"| {label} | {int(values['count'])} | {values['min']:.4f} | "
-            f"{values['p25']:.4f} | {values['median']:.4f} | "
-            f"{values['p75']:.4f} | {values['max']:.4f} | "
-            f"{values['mean']:.4f} |"
+            f"| {signal} | {result.threshold:.6f} | "
+            f"{result.false_reject} | {result.false_answer} | "
+            f"{result.true_positive_rate:.4f} | "
+            f"{result.true_negative_rate:.4f} | "
+            f"{result.balanced_accuracy:.4f} |"
         )
     return lines
 
@@ -217,80 +282,112 @@ def _top(result: CaseResult) -> str:
     return f"{item.rule_id} ({item.score:.4f})"
 
 
-def _comparison_table(
-    case_ids: list[str],
-    bm25: dict[str, CaseResult],
-    dense: dict[str, CaseResult],
+def _top_n(result: CaseResult, count: int = 3) -> str:
+    return "; ".join(
+        f"{item.rule_id} ({item.score:.4f})"
+        for item in result.results[:count]
+    )
+
+
+def _focus_table(
     rrf: dict[str, CaseResult],
+    rerank: dict[str, CaseResult],
 ) -> list[str]:
     lines = [
-        "| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |",
-        "|---|---|---|---|---|---|",
+        "| case_id | query | gold | RRF Top3 | Rerank Top3 | RRF gold rank | Rerank gold rank | 救回 |",
+        "|---|---|---|---|---|---:|---:|---|",
     ]
-    if not case_ids:
-        lines.append("| — | 无 | — | — | — | — |")
-        return lines
-    for case_id in case_ids:
-        bm25_result = bm25[case_id]
+    for case_id in FOCUS_CASE_IDS:
+        before = rrf[case_id]
+        after = rerank[case_id]
+        rescued = before.first_gold_rank != 1 and after.first_gold_rank == 1
         lines.append(
-            f"| {case_id} | {bm25_result.case.query} | "
-            f"{', '.join(bm25_result.case.gold_rule_ids)} | "
-            f"{_top(bm25_result)} | {_top(dense[case_id])} | "
-            f"{_top(rrf[case_id])} |"
+            f"| {case_id} | {before.case.query} | "
+            f"{', '.join(before.case.gold_rule_ids)} | {_top_n(before)} | "
+            f"{_top_n(after)} | {before.first_gold_rank or '未召回'} | "
+            f"{after.first_gold_rank or '未进 Top10'} | "
+            f"{'是' if rescued else '否'} |"
         )
     return lines
 
 
-def build_d2_report(
+def _change_table(
+    case_ids: list[str],
+    rrf: dict[str, CaseResult],
+    rerank: dict[str, CaseResult],
+) -> list[str]:
+    lines = [
+        "| case_id | query | gold | RRF top1 | Rerank top1 |",
+        "|---|---|---|---|---|",
+    ]
+    if not case_ids:
+        lines.append("| — | 无 | — | — | — |")
+        return lines
+    for case_id in case_ids:
+        before = rrf[case_id]
+        lines.append(
+            f"| {case_id} | {before.case.query} | "
+            f"{', '.join(before.case.gold_rule_ids)} | {_top(before)} | "
+            f"{_top(rerank[case_id])} |"
+        )
+    return lines
+
+
+def _machine_environment() -> str:
+    import torch
+
+    cpu = platform.processor() or os.getenv("PROCESSOR_IDENTIFIER", "unknown")
+    return (
+        f"{platform.platform()}；CPU={cpu}；logical_cores={os.cpu_count()}；"
+        f"PyTorch={torch.__version__}；torch_threads={torch.get_num_threads()}"
+    )
+
+
+def build_d21_report(
     *,
     formal: dict[str, list[CaseResult]],
     hard: dict[str, list[CaseResult]],
-    dense_all_formal: list[CaseResult],
-    model_name: str,
-    rrf_k: int,
+    formal_all: dict[str, list[CaseResult]],
+    signals: dict[str, tuple[list[float], list[float]]],
+    thresholds: dict[str, ThresholdResult],
+    latencies_ms: list[float],
 ) -> str:
-    bm25 = _by_case(formal["BM25"])
-    dense = _by_case(formal["Dense"])
-    rrf = _by_case(formal["RRF"])
+    formal_rrf = _by_case(formal["RRF"])
+    formal_rerank = _by_case(formal["RRF+Rerank"])
+    rrf = _by_case(formal["RRF"] + hard["RRF"])
+    rerank = _by_case(
+        formal["RRF+Rerank"] + hard["RRF+Rerank"]
+    )
     rescued = [
         case_id
-        for case_id, result in bm25.items()
+        for case_id, result in rrf.items()
         if result.first_gold_rank != 1
-        and rrf[case_id].first_gold_rank == 1
+        and rerank[case_id].first_gold_rank == 1
     ]
     regressed = [
         case_id
-        for case_id, result in bm25.items()
+        for case_id, result in rrf.items()
         if result.first_gold_rank == 1
-        and rrf[case_id].first_gold_rank != 1
+        and rerank[case_id].first_gold_rank != 1
     ]
-    dense_rescued = [
-        case_id
-        for case_id, result in bm25.items()
-        if result.first_gold_rank != 1
-        and dense[case_id].first_gold_rank == 1
-    ]
-    dense_answerable_scores = [
-        result.results[0].score
-        for result in dense_all_formal
-        if result.case.answerable
-    ]
-    dense_unanswerable_scores = [
-        result.results[0].score
-        for result in dense_all_formal
-        if not result.case.answerable
-    ]
+    latency_mean = statistics.fmean(latencies_ms)
+    latency_p50 = _percentile(latencies_ms, 0.50)
+    latency_p95 = _percentile(latencies_ms, 0.95)
+    formal_answerable = sum(
+        result.case.answerable for result in formal_all["Dense"]
+    )
+    formal_unanswerable = len(formal_all["Dense"]) - formal_answerable
 
     lines = [
         (
-            "## D2 Dense Retrieval + RRF — "
+            "## D2.1 CrossEncoder Rerank + 拒答信号对比 — "
             f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
         ),
         "",
-        f"- Dense model：`{model_name}`",
-        "- 文档向量文本：`title + content`；查询使用 BGE 检索前缀",
-        f"- RRF：k={rrf_k}，BM25 top20 + Dense top20",
-        "- 未设置 Dense 拒答阈值",
+        f"- Dense model：`{DENSE_MODEL_NAME}`",
+        f"- Reranker：`{RERANK_MODEL_NAME}`，sentence-transformers CrossEncoder，CPU",
+        f"- 候选：RRF Top{RERANK_CANDIDATE_COUNT}；输入仅为 `(query, title + content)`",
+        f"- 样本：正式集 answerable={formal_answerable}、unanswerable={formal_unanswerable}；hard answerable={len(hard['Dense'])}",
         "",
         "### 正式集（30 answerable）",
         "",
@@ -300,29 +397,34 @@ def build_d2_report(
         "",
         *_method_table(hard),
         "",
-        "### Dense Top1 cosine score 分布（正式集）",
+        "### Rerank CPU 延迟",
         "",
-        *_distribution_table(
-            dense_answerable_scores, dense_unanswerable_scores
-        ),
+        f"- 环境：{_machine_environment()}",
+        f"- 候选数：Top{RERANK_CANDIDATE_COUNT}；query 数：{len(latencies_ms)}",
+        f"- mean={latency_mean:.2f} ms，p50={latency_p50:.2f} ms，p95={latency_p95:.2f} ms",
+        "- 计时范围：构造 CrossEncoder 输入对、CPU 推理、分数排序；不包含 RRF 召回。",
         "",
-        "### A. BM25 Recall@1 失败、RRF Recall@1 成功",
+        "### 三个重点相邻规则失败",
         "",
-        *_comparison_table(rescued, bm25, dense, rrf),
+        *_focus_table(formal_rrf, formal_rerank),
         "",
-        "### B. BM25 Recall@1 成功、RRF Recall@1 失败",
+        "### Rerank 相对 RRF 救回（正式集 + hard 集）",
         "",
-        *_comparison_table(regressed, bm25, dense, rrf),
+        *_change_table(rescued, rrf, rerank),
         "",
-        "### C. Dense Recall@1 独有救回（相对 BM25）",
+        "### Rerank 相对 RRF 新变差（正式集 + hard 集）",
         "",
-        *_comparison_table(dense_rescued, bm25, dense, rrf),
+        *_change_table(regressed, rrf, rerank),
         "",
-        "### D1.1 三条重点失败复查",
+        "### 拒答信号分布（answerable=正式30+hard10，unanswerable=正式10）",
         "",
-        *_comparison_table(
-            list(FOCUS_CASE_IDS), bm25, dense, rrf
-        ),
+        *_distribution_table(signals),
+        "",
+        "### 探索性拒答阈值",
+        "",
+        *_threshold_table(thresholds),
+        "",
+        "> 阈值和指标来自同一小样本集，仅作为 D3 的探索信号，不能视为泛化性能结论。",
         "",
     ]
     return "\n".join(lines)
@@ -343,8 +445,14 @@ def _validate_gold(
         raise ValueError(f"Eval 引用了不存在的规则: {unknown_gold}")
 
 
+def _top1_scores(results: list[CaseResult]) -> list[float]:
+    return [result.results[0].score for result in results]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BM25、Dense 与 RRF 规则检索评测")
+    parser = argparse.ArgumentParser(
+        description="BM25、Dense、RRF 与 CrossEncoder Rerank 评测"
+    )
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES_PATH)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
     parser.add_argument(
@@ -353,7 +461,6 @@ def main() -> None:
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--k1", type=float, default=1.5)
     parser.add_argument("--b", type=float, default=0.75)
-    parser.add_argument("--dense-model", default=MODEL_NAME)
     parser.add_argument("--dense-cache", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--rrf-k", type=int, default=60)
     arguments = parser.parse_args()
@@ -367,33 +474,71 @@ def main() -> None:
     bm25_index = BM25Index(chunks, k1=arguments.k1, b=arguments.b)
     dense_index = DenseIndex(
         chunks,
-        model_name=arguments.dense_model,
+        model_name=DENSE_MODEL_NAME,
         cache_dir=arguments.dense_cache,
     )
     rrf_index = RRFIndex(
         bm25_index, dense_index, k=arguments.rrf_k, candidate_count=20
     )
-
+    rerank_index = RerankIndex(
+        rrf_index,
+        model_name=RERANK_MODEL_NAME,
+        candidate_count=RERANK_CANDIDATE_COUNT,
+        batch_size=RERANK_CANDIDATE_COUNT,
+        device="cpu",
+    )
+    indexes: dict[str, SearchIndex] = {
+        "BM25": bm25_index,
+        "Dense": dense_index,
+        "RRF": rrf_index,
+        "RRF+Rerank": rerank_index,
+    }
     formal_all = {
-        "BM25": evaluate(bm25_index, formal_cases),
-        "Dense": evaluate(dense_index, formal_cases),
-        "RRF": evaluate(rrf_index, formal_cases),
+        method: evaluate(index, formal_cases)
+        for method, index in indexes.items()
+    }
+    hard_all = {
+        method: evaluate(index, hard_cases)
+        for method, index in indexes.items()
     }
     formal = {
         method: [result for result in results if result.case.answerable]
         for method, results in formal_all.items()
     }
-    hard = {
-        "BM25": evaluate(bm25_index, hard_cases),
-        "Dense": evaluate(dense_index, hard_cases),
-        "RRF": evaluate(rrf_index, hard_cases),
+
+    dense_answerable = _top1_scores(formal["Dense"] + hard_all["Dense"])
+    dense_unanswerable = _top1_scores(
+        [
+            result
+            for result in formal_all["Dense"]
+            if not result.case.answerable
+        ]
+    )
+    rerank_answerable = _top1_scores(
+        formal["RRF+Rerank"] + hard_all["RRF+Rerank"]
+    )
+    rerank_unanswerable = _top1_scores(
+        [
+            result
+            for result in formal_all["RRF+Rerank"]
+            if not result.case.answerable
+        ]
+    )
+    signals = {
+        "Dense cosine": (dense_answerable, dense_unanswerable),
+        "Rerank score": (rerank_answerable, rerank_unanswerable),
     }
-    report = build_d2_report(
+    thresholds = {
+        signal: select_threshold(answerable, unanswerable)
+        for signal, (answerable, unanswerable) in signals.items()
+    }
+    report = build_d21_report(
         formal=formal,
-        hard=hard,
-        dense_all_formal=formal_all["Dense"],
-        model_name=arguments.dense_model,
-        rrf_k=arguments.rrf_k,
+        hard=hard_all,
+        formal_all=formal_all,
+        signals=signals,
+        thresholds=thresholds,
+        latencies_ms=rerank_index.latencies_ms,
     )
 
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
