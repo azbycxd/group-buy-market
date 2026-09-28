@@ -13,6 +13,7 @@ from threading import Lock
 from typing import Annotated, Any, AsyncIterator
 
 import jwt
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -464,7 +465,9 @@ async def _reconciler_loop() -> None:
 
 async def _warmup_rag(app: FastAPI) -> None:
     started = time.perf_counter()
-    await asyncio.to_thread(warmup_rule_search_pipeline)
+    app.state.rag_pipeline = await asyncio.to_thread(
+        warmup_rule_search_pipeline
+    )
     latency_ms = (time.perf_counter() - started) * 1000
     app.state.rag_warmup_latency_ms = latency_ms
     logger.info("rag_warmup_completed latency_ms=%.2f", latency_ms)
@@ -524,6 +527,49 @@ def create_app(
             await close_async_order_agent(app.state.agent)
 
     app = FastAPI(title="Group Buy Agent API", lifespan=lifespan)
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "healthy"}
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        pipeline = getattr(app.state, "rag_pipeline", None)
+        rag_ready = (
+            pipeline is not None
+            and getattr(pipeline, "dense", None) is not None
+            and getattr(pipeline, "reranker", None) is not None
+        )
+        java_base_url = os.getenv("JAVA_BASE_URL", "").strip()
+        java_ready = False
+        if rag_ready and java_base_url:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(3.0, connect=2.0),
+                    trust_env=False,
+                ) as client:
+                    response = await client.get(
+                        f"{java_base_url.rstrip('/')}"
+                        "/actuator/health/liveness"
+                    )
+                java_ready = response.status_code == status.HTTP_200_OK
+            except httpx.HTTPError:
+                java_ready = False
+        ready = rag_ready and java_ready
+        return JSONResponse(
+            status_code=(
+                status.HTTP_200_OK
+                if ready
+                else status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            content={
+                "status": "ready" if ready else "not_ready",
+                "rag": "ready" if rag_ready else "not_ready",
+                "dense_model": "ready" if rag_ready else "not_ready",
+                "cross_encoder": "ready" if rag_ready else "not_ready",
+                "java": "ready" if java_ready else "not_ready",
+            },
+        )
 
     @app.post("/api/v1/chat/stream")
     async def chat_stream(

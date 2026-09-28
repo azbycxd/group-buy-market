@@ -204,3 +204,36 @@ StateGraph 会从持久化状态继续执行。因此参数补充不依赖解析
 
 Store 用于跨 thread 或更长期的应用记忆、用户记忆，不等于当前工作流的执行
 状态。B1 只实现 Checkpointer，不实现 Store 或长期记忆。
+
+## 本机全栈 Docker Demo
+
+Agent 与 Java 仓库需要并排放置为 `group-buy-agent-v3/` 和
+`group-buy-market-jiusi/`。复制 `deploy/.env.demo.example` 为
+`deploy/.env.demo` 并填写本地 secret 后，从 Agent 仓库运行：
+
+```bash
+docker compose --env-file deploy/.env.demo -f deploy/compose.yml up -d --build
+```
+
+该 Compose 通过 `include` 引入 Java 的
+`group-buy-market-jiusi/deploy/demo/docker-compose.yml`，启动 Agent、Java、
+MySQL、Redis 和 RabbitMQ。只有 Agent 映射到宿主机
+`127.0.0.1:8000`；其他服务仅在 `demo-backend` 网络内可见。
+
+- `GET /healthz`：Agent 进程健康。
+- `GET /readyz`：RAG、Dense、CrossEncoder 已预热且 Java liveness 可达。
+
+FastAPI lifespan 会在 `yield` 前完成 RAG warmup，因此预热期间服务器尚未
+开始接收请求，`/healthz` 也暂时不可访问。这保持了“ready 后模型必定已加载”
+的现有安全行为；Compose healthcheck 使用 90 秒 `start_period`。
+
+镜像构建时已将 `BAAI/bge-small-zh-v1.5` 与
+`BAAI/bge-reranker-base` 下载到 `/opt/huggingface`。运行时设置
+`HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，不会在线下载模型。
+SQLite checkpoint、session ownership、confirmation graph 状态、退款 action
+台账及 Dense 文档向量缓存都保存在 `/app/data` named volume。
+
+Demo 固定使用单个 Uvicorn worker。当前 session lock 是进程内
+`asyncio.Lock`，background reconciler 也按单进程运行。未来横向扩展必须增加
+分布式 session lock，并将 reconciler 改为 leader 或独立 worker，避免多实例
+并发推进同一状态。

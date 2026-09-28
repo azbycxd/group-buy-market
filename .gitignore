@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .idea/
 .venv/
+deploy/.env.demo
 data/*.sqlite*
 data/*.log
 data/log/

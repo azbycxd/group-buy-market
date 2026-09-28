@@ -1,0 +1,47 @@
+name: group-buy-full-demo
+
+include:
+  - path: ../../group-buy-market-jiusi/deploy/demo/docker-compose.yml
+
+services:
+  agent:
+    image: group-buy-agent:demo
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.demo
+    environment:
+      JAVA_BASE_URL: http://java:8091
+      JAVA_INTERNAL_JWT_SECRET: ${AGENT_INTERNAL_JWT_SECRET:?set AGENT_INTERNAL_JWT_SECRET}
+      JAVA_INTERNAL_JWT_ISSUER: ${AGENT_INTERNAL_JWT_ISSUER:?set AGENT_INTERNAL_JWT_ISSUER}
+      JAVA_INTERNAL_JWT_AUDIENCE: ${AGENT_INTERNAL_JWT_AUDIENCE:?set AGENT_INTERNAL_JWT_AUDIENCE}
+      CHECKPOINT_DB_PATH: /app/data/checkpoints.sqlite
+      AGENT_ACTION_DB_PATH: /app/data/agent_actions.sqlite
+      RAG_DENSE_CACHE_DIR: /app/data/rag_cache
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - agent-data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      java:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 90s
+    networks:
+      - demo-backend
+
+volumes:
+  agent-data:
