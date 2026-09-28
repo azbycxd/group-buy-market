@@ -5,17 +5,33 @@ import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 
 import yaml
 
 from rag.bm25 import BM25Index, SearchResult
 from rag.chunking import DEFAULT_RULES_PATH, RuleChunk, load_rule_chunks
+from rag.dense import DEFAULT_CACHE_DIR, MODEL_NAME, DenseIndex
+from rag.fusion import RRFIndex
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES_PATH = PROJECT_ROOT / "evals" / "rule_retrieval.yaml"
+DEFAULT_HARD_CASES_PATH = (
+    PROJECT_ROOT / "evals" / "rule_retrieval_hard.yaml"
+)
 DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "rag_eval.md"
+FOCUS_CASE_IDS = (
+    "activity_not_active",
+    "joinable_team_conditions",
+    "formed_refund_review",
+)
+
+
+class SearchIndex(Protocol):
+    chunks: list[RuleChunk]
+
+    def search(self, query: str, *, top_k: int = 5) -> list[SearchResult]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +54,10 @@ class CaseResult:
 
 def load_cases(path: str | Path) -> list[RetrievalCase]:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        raw = raw.get("cases")
     if not isinstance(raw, list):
-        raise ValueError("rule_retrieval.yaml 顶层必须是列表")
+        raise ValueError("检索评测 YAML 顶层必须是列表或包含 cases 列表")
     cases: list[RetrievalCase] = []
     seen: set[str] = set()
     for item in raw:
@@ -68,7 +86,7 @@ def load_cases(path: str | Path) -> list[RetrievalCase]:
 
 
 def evaluate(
-    index: BM25Index,
+    index: SearchIndex,
     cases: list[RetrievalCase],
 ) -> list[CaseResult]:
     evaluated: list[CaseResult] = []
@@ -93,11 +111,35 @@ def evaluate(
     return evaluated
 
 
-def _recall(results: list[CaseResult], at: int) -> float:
-    return sum(
-        result.first_gold_rank is not None and result.first_gold_rank <= at
-        for result in results
-    ) / len(results)
+def metrics(results: list[CaseResult]) -> dict[str, float]:
+    if not results:
+        raise ValueError("指标至少需要一条 Case")
+    return {
+        "Recall@1": sum(
+            result.first_gold_rank is not None
+            and result.first_gold_rank <= 1
+            for result in results
+        )
+        / len(results),
+        "Recall@3": sum(
+            result.first_gold_rank is not None
+            and result.first_gold_rank <= 3
+            for result in results
+        )
+        / len(results),
+        "Recall@5": sum(
+            result.first_gold_rank is not None
+            and result.first_gold_rank <= 5
+            for result in results
+        )
+        / len(results),
+        "MRR": statistics.fmean(
+            0.0
+            if result.first_gold_rank is None
+            else 1 / result.first_gold_rank
+            for result in results
+        ),
+    }
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -112,6 +154,8 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 def score_distribution(values: list[float]) -> dict[str, float]:
+    if not values:
+        raise ValueError("分数分布至少需要一个值")
     return {
         "count": float(len(values)),
         "min": min(values),
@@ -123,35 +167,36 @@ def score_distribution(values: list[float]) -> dict[str, float]:
     }
 
 
-def _metric_table(answerable: list[CaseResult]) -> list[str]:
-    reciprocal_ranks = [
-        0.0 if result.first_gold_rank is None else 1 / result.first_gold_rank
-        for result in answerable
+def _method_table(
+    evaluations: dict[str, list[CaseResult]],
+) -> list[str]:
+    lines = [
+        "| Method | Recall@1 | Recall@3 | Recall@5 | MRR |",
+        "|---|---:|---:|---:|---:|",
     ]
-    return [
-        "| 指标 | 结果 |",
-        "|---|---:|",
-        f"| Recall@1 | {_recall(answerable, 1):.4f} |",
-        f"| Recall@3 | {_recall(answerable, 3):.4f} |",
-        f"| Recall@5 | {_recall(answerable, 5):.4f} |",
-        f"| MRR | {statistics.fmean(reciprocal_ranks):.4f} |",
-    ]
+    for method in ("BM25", "Dense", "RRF"):
+        values = metrics(evaluations[method])
+        lines.append(
+            f"| {method} | {values['Recall@1']:.4f} | "
+            f"{values['Recall@3']:.4f} | {values['Recall@5']:.4f} | "
+            f"{values['MRR']:.4f} |"
+        )
+    return lines
 
 
 def _distribution_table(
     answerable_scores: list[float],
     unanswerable_scores: list[float],
 ) -> list[str]:
-    answerable = score_distribution(answerable_scores)
-    unanswerable = score_distribution(unanswerable_scores)
     lines = [
         "| 类型 | count | min | p25 | median | p75 | max | mean |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for label, values in (
-        ("answerable", answerable),
-        ("unanswerable", unanswerable),
+    for label, scores in (
+        ("answerable", answerable_scores),
+        ("unanswerable", unanswerable_scores),
     ):
+        values = score_distribution(scores)
         lines.append(
             f"| {label} | {int(values['count'])} | {values['min']:.4f} | "
             f"{values['p25']:.4f} | {values['median']:.4f} | "
@@ -161,105 +206,131 @@ def _distribution_table(
     return lines
 
 
-def _failure_reason(
-    result: CaseResult,
-    chunks_by_id: dict[str, RuleChunk],
-) -> str:
-    top = result.results[0]
-    gold = chunks_by_id[result.case.gold_rule_ids[0]]
-    if top.section == gold.section:
-        return "同章节规则共享大量业务词，BM25 缺少语义消歧。"
-    return "口语改写与 gold 规则字面重合较少，其他章节的高频词获得更高分。"
+def _by_case(results: list[CaseResult]) -> dict[str, CaseResult]:
+    return {result.case.case_id: result for result in results}
 
 
-def build_report(
+def _top(result: CaseResult) -> str:
+    if not result.results:
+        return "-"
+    item = result.results[0]
+    return f"{item.rule_id} ({item.score:.4f})"
+
+
+def _comparison_table(
+    case_ids: list[str],
+    bm25: dict[str, CaseResult],
+    dense: dict[str, CaseResult],
+    rrf: dict[str, CaseResult],
+) -> list[str]:
+    lines = [
+        "| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |",
+        "|---|---|---|---|---|---|",
+    ]
+    if not case_ids:
+        lines.append("| — | 无 | — | — | — | — |")
+        return lines
+    for case_id in case_ids:
+        bm25_result = bm25[case_id]
+        lines.append(
+            f"| {case_id} | {bm25_result.case.query} | "
+            f"{', '.join(bm25_result.case.gold_rule_ids)} | "
+            f"{_top(bm25_result)} | {_top(dense[case_id])} | "
+            f"{_top(rrf[case_id])} |"
+        )
+    return lines
+
+
+def build_d2_report(
     *,
-    evaluated: list[CaseResult],
-    chunks: list[RuleChunk],
-    internal_count: int,
-    k1: float,
-    b: float,
+    formal: dict[str, list[CaseResult]],
+    hard: dict[str, list[CaseResult]],
+    dense_all_formal: list[CaseResult],
+    model_name: str,
+    rrf_k: int,
 ) -> str:
-    answerable = [result for result in evaluated if result.case.answerable]
-    unanswerable = [result for result in evaluated if not result.case.answerable]
-    answerable_scores = [result.results[0].score for result in answerable]
-    unanswerable_scores = [result.results[0].score for result in unanswerable]
-    chunks_by_id = {chunk.rule_id: chunk for chunk in chunks}
-    failures = [
-        result
-        for result in answerable
+    bm25 = _by_case(formal["BM25"])
+    dense = _by_case(formal["Dense"])
+    rrf = _by_case(formal["RRF"])
+    rescued = [
+        case_id
+        for case_id, result in bm25.items()
         if result.first_gold_rank != 1
+        and rrf[case_id].first_gold_rank == 1
+    ]
+    regressed = [
+        case_id
+        for case_id, result in bm25.items()
+        if result.first_gold_rank == 1
+        and rrf[case_id].first_gold_rank != 1
+    ]
+    dense_rescued = [
+        case_id
+        for case_id, result in bm25.items()
+        if result.first_gold_rank != 1
+        and dense[case_id].first_gold_rank == 1
+    ]
+    dense_answerable_scores = [
+        result.results[0].score
+        for result in dense_all_formal
+        if result.case.answerable
+    ]
+    dense_unanswerable_scores = [
+        result.results[0].score
+        for result in dense_all_formal
+        if not result.case.answerable
     ]
 
     lines = [
         (
-            "## D1.1 客服业务规则 baseline — "
+            "## D2 Dense Retrieval + RRF — "
             f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
         ),
         "",
-        f"- 规则数：public={len(chunks)}，internal={internal_count}",
-        f"- Eval：{len(evaluated)}（answerable={len(answerable)}，unanswerable={len(unanswerable)}）",
-        f"- BM25 参数：k1={k1}，b={b}",
+        f"- Dense model：`{model_name}`",
+        "- 文档向量文本：`title + content`；查询使用 BGE 检索前缀",
+        f"- RRF：k={rrf_k}，BM25 top20 + Dense top20",
+        "- 未设置 Dense 拒答阈值",
         "",
-        "### Answerable 指标",
+        "### 正式集（30 answerable）",
         "",
-        *_metric_table(answerable),
+        *_method_table(formal),
         "",
-        "### Top1 score 分布",
+        "### 人工 hard 集（10 answerable，独立统计）",
         "",
-        *_distribution_table(answerable_scores, unanswerable_scores),
+        *_method_table(hard),
         "",
-        "### Unanswerable 每条 Top1",
+        "### Dense Top1 cosine score 分布（正式集）",
         "",
-        "| case_id | query | top1 | score |",
-        "|---|---|---|---:|",
+        *_distribution_table(
+            dense_answerable_scores, dense_unanswerable_scores
+        ),
+        "",
+        "### A. BM25 Recall@1 失败、RRF Recall@1 成功",
+        "",
+        *_comparison_table(rescued, bm25, dense, rrf),
+        "",
+        "### B. BM25 Recall@1 成功、RRF Recall@1 失败",
+        "",
+        *_comparison_table(regressed, bm25, dense, rrf),
+        "",
+        "### C. Dense Recall@1 独有救回（相对 BM25）",
+        "",
+        *_comparison_table(dense_rescued, bm25, dense, rrf),
+        "",
+        "### D1.1 三条重点失败复查",
+        "",
+        *_comparison_table(
+            list(FOCUS_CASE_IDS), bm25, dense, rrf
+        ),
+        "",
     ]
-    for result in unanswerable:
-        top = result.results[0]
-        lines.append(
-            f"| {result.case.case_id} | {result.case.query} | "
-            f"{top.rule_id} | {top.score:.4f} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "### Recall@1 失败明细",
-            "",
-            "| query | gold rule | BM25 top results | 失败原因 |",
-            "|---|---|---|---|",
-        ]
-    )
-    for result in failures:
-        gold = ", ".join(result.case.gold_rule_ids)
-        top_results = "; ".join(
-            f"{item.rule_id} ({item.score:.4f})"
-            for item in result.results[:3]
-        )
-        lines.append(
-            f"| {result.case.query} | {gold} | {top_results} | "
-            f"{_failure_reason(result, chunks_by_id)} |"
-        )
-    lines.append("")
     return "\n".join(lines)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="BM25 规则检索基线评测")
-    parser.add_argument("--rules", type=Path, default=DEFAULT_RULES_PATH)
-    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
-    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT_PATH)
-    parser.add_argument("--k1", type=float, default=1.5)
-    parser.add_argument("--b", type=float, default=0.75)
-    arguments = parser.parse_args()
-
-    all_rules = load_rule_chunks(arguments.rules, include_internal=True)
-    chunks = [rule for rule in all_rules if rule.visibility == "public"]
-    internal_count = sum(
-        rule.visibility == "internal" for rule in all_rules
-    )
-    cases = load_cases(arguments.cases)
-    known_rule_ids = {chunk.rule_id for chunk in chunks}
+def _validate_gold(
+    cases: list[RetrievalCase], known_rule_ids: set[str]
+) -> None:
     unknown_gold = sorted(
         {
             rule_id
@@ -271,20 +342,69 @@ def main() -> None:
     if unknown_gold:
         raise ValueError(f"Eval 引用了不存在的规则: {unknown_gold}")
 
-    index = BM25Index(chunks, k1=arguments.k1, b=arguments.b)
-    evaluated = evaluate(index, cases)
-    report = build_report(
-        evaluated=evaluated,
-        chunks=chunks,
-        internal_count=internal_count,
-        k1=arguments.k1,
-        b=arguments.b,
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="BM25、Dense 与 RRF 规则检索评测")
+    parser.add_argument("--rules", type=Path, default=DEFAULT_RULES_PATH)
+    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
+    parser.add_argument(
+        "--hard-cases", type=Path, default=DEFAULT_HARD_CASES_PATH
     )
+    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT_PATH)
+    parser.add_argument("--k1", type=float, default=1.5)
+    parser.add_argument("--b", type=float, default=0.75)
+    parser.add_argument("--dense-model", default=MODEL_NAME)
+    parser.add_argument("--dense-cache", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--rrf-k", type=int, default=60)
+    arguments = parser.parse_args()
+
+    chunks = load_rule_chunks(arguments.rules)
+    formal_cases = load_cases(arguments.cases)
+    hard_cases = load_cases(arguments.hard_cases)
+    known_rule_ids = {chunk.rule_id for chunk in chunks}
+    _validate_gold(formal_cases + hard_cases, known_rule_ids)
+
+    bm25_index = BM25Index(chunks, k1=arguments.k1, b=arguments.b)
+    dense_index = DenseIndex(
+        chunks,
+        model_name=arguments.dense_model,
+        cache_dir=arguments.dense_cache,
+    )
+    rrf_index = RRFIndex(
+        bm25_index, dense_index, k=arguments.rrf_k, candidate_count=20
+    )
+
+    formal_all = {
+        "BM25": evaluate(bm25_index, formal_cases),
+        "Dense": evaluate(dense_index, formal_cases),
+        "RRF": evaluate(rrf_index, formal_cases),
+    }
+    formal = {
+        method: [result for result in results if result.case.answerable]
+        for method, results in formal_all.items()
+    }
+    hard = {
+        "BM25": evaluate(bm25_index, hard_cases),
+        "Dense": evaluate(dense_index, hard_cases),
+        "RRF": evaluate(rrf_index, hard_cases),
+    }
+    report = build_d2_report(
+        formal=formal,
+        hard=hard,
+        dense_all_formal=formal_all["Dense"],
+        model_name=arguments.dense_model,
+        rrf_k=arguments.rrf_k,
+    )
+
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
     existed = arguments.report.exists() and arguments.report.stat().st_size > 0
     with arguments.report.open("a", encoding="utf-8", newline="\n") as file:
         if not existed:
-            file.write("# BM25 规则检索评测\n\n")
+            file.write("# 规则检索评测\n\n")
+        elif arguments.report.read_text(encoding="utf-8").endswith("\n"):
+            file.write("\n")
+        else:
+            file.write("\n\n")
         file.write(report)
 
     print(report)

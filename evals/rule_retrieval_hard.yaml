@@ -1,0 +1,50 @@
+cases:
+  - id: hard_01
+    query: "页面上明明写着这个活动是开的，我现在进去就一定还能参加吗？"
+    gold_rule_ids:
+      - ACT-004
+
+  - id: hard_02
+    query: "我之前跟过一次，后来那单退掉了，这回再参加还算占过次数吗？"
+    gold_rule_ids:
+      - ELG-002
+
+  - id: hard_03
+    query: "我自己拉起来的那个队，系统还会不会又推荐给我让我自己加自己？"
+    gold_rule_ids:
+      - TEAM-006
+
+  - id: hard_04
+    query: "页面上看着有好几个队，是不是这些我现在都能直接进去？"
+    gold_rule_ids:
+      - TEAM-008
+
+  - id: hard_05
+    query: "我刚自己开了一个团，这个团能撑多久，是从我开出来那会儿开始算吗？"
+    gold_rule_ids:
+      - ACT-005
+
+  - id: hard_06
+    query: "这单都已经关掉了，我现在再补个钱还能把它弄回来不？"
+    gold_rule_ids:
+      - ORD-004
+
+  - id: hard_07
+    query: "我还没付钱呢，现在不想跟了，取消以后我占的那个位置会腾出来吗？"
+    gold_rule_ids:
+      - RFD-003
+
+  - id: hard_08
+    query: "钱我已经付了，但这个团人还没凑齐，我现在想退的话系统能直接给我办吗？"
+    gold_rule_ids:
+      - PRE-004
+
+  - id: hard_09
+    query: "钱也付了，人也凑齐了，这种情况我还能自己点退，还是得找人处理？"
+    gold_rule_ids:
+      - PRE-005
+
+  - id: hard_10
+    query: "我这边已经显示订单关了，那是不是说明退款肯定已经回到银行卡里了？"
+    gold_rule_ids:
+      - RFD-007

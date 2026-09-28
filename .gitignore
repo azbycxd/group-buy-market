@@ -6,3 +6,5 @@ __pycache__/
 data/*.sqlite*
 data/*.log
 data/log/
+data/rag_cache/
+data/pytest-*/

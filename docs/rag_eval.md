@@ -1,4 +1,4 @@
-# BM25 规则检索评测
+# 规则检索评测
 
 ## D1 baseline — DEPRECATED
 
@@ -115,3 +115,66 @@
 | 订单已经关掉了，还能重新把钱付上吗？ | ORD-004 | PRE-007 (5.1751); ELG-003 (4.6172); RFD-007 (2.2401) | 口语改写与 gold 规则字面重合较少，其他章节的高频词获得更高分。 |
 | 钱付了而且团也成了，我申请退款是不是得人工处理？ | PRE-005 | PRE-006 (9.5978); ELG-003 (6.9129); TMO-001 (4.4198) | 同章节规则共享大量业务词，BM25 缺少语义消歧。 |
 | 退款方案出来后订单情况变了，还能按原来的继续确认吗？ | PRE-007 | RFD-007 (5.5446); RFD-001 (5.2255); ELG-004 (5.0771) | 口语改写与 gold 规则字面重合较少，其他章节的高频词获得更高分。 |
+
+## D2 Dense Retrieval + RRF — 2026-09-28T12:53:08+00:00
+
+- Dense model：`BAAI/bge-small-zh-v1.5`
+- 文档向量文本：`title + content`；查询使用 BGE 检索前缀
+- RRF：k=60，BM25 top20 + Dense top20
+- 未设置 Dense 拒答阈值
+
+### 正式集（30 answerable）
+
+| Method | Recall@1 | Recall@3 | Recall@5 | MRR |
+|---|---:|---:|---:|---:|
+| BM25 | 0.6667 | 0.8000 | 0.8667 | 0.7651 |
+| Dense | 0.7667 | 0.9000 | 1.0000 | 0.8456 |
+| RRF | 0.7333 | 0.9667 | 1.0000 | 0.8567 |
+
+### 人工 hard 集（10 answerable，独立统计）
+
+| Method | Recall@1 | Recall@3 | Recall@5 | MRR |
+|---|---:|---:|---:|---:|
+| BM25 | 0.6000 | 0.8000 | 0.9000 | 0.7119 |
+| Dense | 0.6000 | 0.9000 | 1.0000 | 0.7750 |
+| RRF | 0.8000 | 0.9000 | 0.9000 | 0.8625 |
+
+### Dense Top1 cosine score 分布（正式集）
+
+| 类型 | count | min | p25 | median | p75 | max | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| answerable | 30 | 0.5949 | 0.6529 | 0.7113 | 0.7562 | 0.8212 | 0.7067 |
+| unanswerable | 10 | 0.4163 | 0.5226 | 0.5634 | 0.5988 | 0.6186 | 0.5530 |
+
+### A. BM25 Recall@1 失败、RRF Recall@1 成功
+
+| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |
+|---|---|---|---|---|---|
+| participation_limit | 提示次数用光了，我还能再跟一次团吗？ | ELG-004 | ELG-003 (5.7650) | ELG-004 (0.6492) | ELG-004 (0.0325) |
+| closed_order_payment | 订单已经关掉了，还能重新把钱付上吗？ | ORD-004 | PRE-007 (5.1751) | ORD-004 (0.7139) | ORD-004 (0.0318) |
+| proposal_changed_state | 退款方案出来后订单情况变了，还能按原来的继续确认吗？ | PRE-007 | RFD-007 (5.5446) | PRE-007 (0.7827) | PRE-007 (0.0313) |
+
+### B. BM25 Recall@1 成功、RRF Recall@1 失败
+
+| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |
+|---|---|---|---|---|---|
+| team_total_not_joinable | 活动说有很多团，为啥我这边一个能加入的都没有？ | TEAM-008 | TEAM-008 (7.8177) | TEAM-007 (0.6562) | TEAM-005 (0.0320) |
+
+### C. Dense Recall@1 独有救回（相对 BM25）
+
+| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |
+|---|---|---|---|---|---|
+| participation_count | 同一个活动我到底参加过几回，平台是怎么数的？ | ELG-001 | ACT-004 (4.5343) | ELG-001 (0.6709) | TEAM-008 (0.0318) |
+| participation_limit | 提示次数用光了，我还能再跟一次团吗？ | ELG-004 | ELG-003 (5.7650) | ELG-004 (0.6492) | ELG-004 (0.0325) |
+| audience_visibility | 朋友能看到活动入口，我这边完全没有，是人群限制吗？ | ELG-008 | ELG-005 (13.0664) | ELG-008 (0.7504) | ELG-005 (0.0325) |
+| closed_order_payment | 订单已经关掉了，还能重新把钱付上吗？ | ORD-004 | PRE-007 (5.1751) | ORD-004 (0.7139) | ORD-004 (0.0318) |
+| formed_refund_review | 钱付了而且团也成了，我申请退款是不是得人工处理？ | PRE-005 | PRE-006 (9.5978) | PRE-005 (0.7499) | PRE-006 (0.0318) |
+| proposal_changed_state | 退款方案出来后订单情况变了，还能按原来的继续确认吗？ | PRE-007 | RFD-007 (5.5446) | PRE-007 (0.7827) | PRE-007 (0.0313) |
+
+### D1.1 三条重点失败复查
+
+| case_id | query | gold | BM25 top1 | Dense top1 | RRF top1 |
+|---|---|---|---|---|---|
+| activity_not_active | 页面还说活动没开始，我能不能先拼上？ | ACT-002 | ACT-003 (6.6297) | ACT-004 (0.6017) | ACT-003 (0.0320) |
+| joinable_team_conditions | 什么样的别人队伍才会出现在可以加入的列表里？ | TEAM-005 | TEAM-006 (12.2707) | TEAM-006 (0.6981) | TEAM-006 (0.0328) |
+| formed_refund_review | 钱付了而且团也成了，我申请退款是不是得人工处理？ | PRE-005 | PRE-006 (9.5978) | PRE-005 (0.7499) | PRE-006 (0.0318) |
