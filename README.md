@@ -237,3 +237,28 @@ Demo 固定使用单个 Uvicorn worker。当前 session lock 是进程内
 `asyncio.Lock`，background reconciler 也按单进程运行。未来横向扩展必须增加
 分布式 session lock，并将 reconciler 改为 leader 或独立 worker，避免多实例
 并发推进同一状态。
+
+### 极简面试页面
+
+Compose 默认设置 `DEMO_ENABLED=true`。服务 ready 后打开
+`http://127.0.0.1:8000/`，点击“开始体验”即可。页面调用
+`POST /demo/session` 获取 30 分钟有效的固定 `demo_user` 访问令牌与四个演示订单；
+浏览器不能提交或选择 `user_id`。JWT 和退款确认 credential 只保存在页面内存，
+不会写入 URL、Web Storage、控制台或普通聊天消息。页面只把非敏感
+`lease_token` 写入 `sessionStorage`；刷新后用它恢复同一 lease 并重新签发短期
+Demo JWT。`lease_token` 不能作为 Bearer token 调用 Agent 或 Java API。
+
+这是单访客面试环境：进程内 lease 同一时间只允许一个未过期体验会话，其他访客
+会收到 `429`“演示环境正在使用，请稍后再试。”；每个聊天 session 每分钟最多
+20 条请求，单条消息最多 500 字。lease 在 30 分钟后自动释放，服务重启也会清空。
+`DEMO_ENABLED` 未开启时，页面和 `/demo/session` 均不注册并返回 `404`。
+
+公开 Demo 是单访客演示环境，不是多租户生产服务。面试前如需恢复 Java 订单、
+SQLite checkpoint 和 action ledger 的初始状态，由部署人员执行：
+
+```bash
+docker compose --env-file deploy/.env.demo -f deploy/compose.yml down -v
+docker compose --env-file deploy/.env.demo -f deploy/compose.yml up -d --build
+```
+
+当前不提供在线 Reset API。

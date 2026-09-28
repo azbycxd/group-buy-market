@@ -24,6 +24,7 @@ COPY fake_java /app/fake_java
 COPY rag /app/rag
 COPY tools /app/tools
 COPY docs/rules /app/docs/rules
+COPY demo_static /app/demo_static
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install \

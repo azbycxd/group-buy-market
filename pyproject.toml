@@ -24,5 +24,5 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["action_ledger", "agent", "agent_middleware", "api", "cli", "confirmation_workflow", "evidence", "outcome", "reconciler", "requirement_tracker", "session_locks", "session_ownership", "understanding"]
+py-modules = ["action_ledger", "agent", "agent_middleware", "api", "cli", "confirmation_workflow", "demo", "evidence", "outcome", "reconciler", "requirement_tracker", "session_locks", "session_ownership", "understanding"]
 packages = ["fake_java", "rag", "tools"]

@@ -15,7 +15,7 @@ from typing import Annotated, Any, AsyncIterator
 import jwt
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
@@ -39,6 +39,12 @@ from confirmation_workflow import (
     close_async_confirmation_workflow,
     confirmation_config,
     create_async_confirmation_workflow,
+)
+from demo import (
+    DEMO_USER_ID,
+    DemoRateLimiter,
+    DemoSessionBusyError,
+    DemoSessionLease,
 )
 from outcome import AgentOutcome, OutcomeKind
 from reconciler import reconcile_stuck_actions
@@ -68,13 +74,23 @@ class ChatStreamRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str = Field(min_length=1)
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=500)
 
 
 class ActionConfirmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     credential: str = Field(min_length=64, max_length=64)
+
+
+class DemoSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_token: str | None = Field(
+        default=None,
+        min_length=32,
+        max_length=128,
+    )
 
 
 def _positive_float(value: str | None, default: float) -> float:
@@ -90,6 +106,10 @@ def _required_jwt_secret() -> str:
     if not secret:
         raise RuntimeError("缺少环境变量: JWT_SECRET")
     return secret
+
+
+def _enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _unauthorized() -> HTTPException:
@@ -260,6 +280,7 @@ async def authenticated_user_id(
     user_id = claims.get("sub")
     if not isinstance(user_id, str) or not user_id.strip():
         raise _unauthorized()
+    request.state.auth_claims = claims
     return user_id
 
 
@@ -478,6 +499,9 @@ def create_app(
     checkpoint_path: str | Path | None = None,
     request_timeout_seconds: float | None = None,
 ) -> FastAPI:
+    demo_enabled = _enabled(os.getenv("DEMO_ENABLED"))
+    demo_static = Path(__file__).resolve().parent / "demo_static"
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         selected_checkpoint = checkpoint_path or Path(
@@ -496,6 +520,9 @@ def create_app(
         app.state.session_locks = SessionLockRegistry()
         app.state.confirmation_locks = SessionLockRegistry()
         app.state.action_store = AgentActionStore()
+        if demo_enabled:
+            app.state.demo_lease = DemoSessionLease()
+            app.state.demo_rate_limiter = DemoRateLimiter()
         await _warmup_rag(app)
         app.state.agent = await create_async_order_agent(selected_checkpoint)
         try:
@@ -527,6 +554,65 @@ def create_app(
             await close_async_order_agent(app.state.agent)
 
     app = FastAPI(title="Group Buy Agent API", lifespan=lifespan)
+
+    if demo_enabled:
+        static_headers = {
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        }
+
+        @app.get("/", include_in_schema=False)
+        async def demo_page() -> FileResponse:
+            return FileResponse(
+                demo_static / "index.html",
+                headers=static_headers,
+            )
+
+        @app.get("/demo/app.js", include_in_schema=False)
+        async def demo_javascript() -> FileResponse:
+            return FileResponse(
+                demo_static / "app.js",
+                media_type="text/javascript",
+                headers=static_headers,
+            )
+
+        @app.get("/demo/styles.css", include_in_schema=False)
+        async def demo_styles() -> FileResponse:
+            return FileResponse(
+                demo_static / "styles.css",
+                media_type="text/css",
+                headers=static_headers,
+            )
+
+        @app.post("/demo/session")
+        async def create_demo_session(
+            request: Request,
+            session_request: DemoSessionRequest | None = None,
+        ) -> JSONResponse:
+            try:
+                session_payload = await request.app.state.demo_lease.issue(
+                    jwt_secret=request.app.state.jwt_secret,
+                    lease_token=(
+                        session_request.lease_token
+                        if session_request is not None
+                        else None
+                    ),
+                )
+            except DemoSessionBusyError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="演示环境正在使用，请稍后再试。",
+                ) from error
+            return JSONResponse(
+                content=session_payload,
+                headers={"Cache-Control": "no-store"},
+            )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -577,6 +663,21 @@ def create_app(
         request: Request,
         user_id: Annotated[str, Depends(authenticated_user_id)],
     ) -> StreamingResponse:
+        if demo_enabled and user_id == DEMO_USER_ID:
+            if not app.state.demo_lease.accepts(
+                getattr(request.state, "auth_claims", None)
+            ):
+                raise _unauthorized()
+            if not await app.state.demo_rate_limiter.allow(
+                payload.session_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail={
+                        "code": "DEMO_RATE_LIMITED",
+                        "message": "请求过于频繁，请稍后再试。",
+                    },
+                )
         request_id = uuid.uuid4().hex
         if not await app.state.session_ownership.claim(
             payload.session_id,

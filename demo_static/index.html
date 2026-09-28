@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>拼团智能客服 Demo</title>
+  <link rel="stylesheet" href="/demo/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">INTERVIEW DEMO</p>
+        <h1>拼团智能客服</h1>
+        <p class="subtitle">查订单、问规则，或体验安全的退款提议与确认流程。</p>
+      </div>
+      <div class="status" id="session-status" aria-live="polite">尚未开始</div>
+    </header>
+
+    <section class="start-panel" id="start-panel">
+      <div>
+        <h2>准备好了吗？</h2>
+        <p>演示使用固定测试身份和隔离订单，一次只接待一位体验者。</p>
+      </div>
+      <button class="primary" id="start-button" type="button">开始体验</button>
+      <p class="notice" id="start-notice" role="status"></p>
+    </section>
+
+    <section class="workspace hidden" id="workspace" aria-label="Demo 聊天区">
+      <aside class="sidebar">
+        <div class="sidebar-title">
+          <span>演示订单</span>
+          <small>固定测试数据</small>
+        </div>
+        <div class="orders" id="orders"></div>
+
+        <div class="try-title">试试这些问题</div>
+        <div class="suggestions">
+          <button type="button" data-question="order">查未付款订单状态</button>
+          <button type="button" data-question="rule">已付款未成团能退吗？</button>
+          <button type="button" data-question="unknown">拼团商品包邮吗？</button>
+          <button type="button" data-question="refund">帮我退掉未付款订单</button>
+        </div>
+      </aside>
+
+      <section class="chat-card">
+        <div class="messages" id="messages" aria-live="polite" aria-label="聊天消息">
+          <article class="message assistant">
+            <span class="avatar">AI</span>
+            <div class="bubble">你好，我可以查询拼团事实、解释规则，并生成退款提议。</div>
+          </article>
+        </div>
+
+        <div class="progress hidden" id="progress" role="status">
+          <span class="pulse"></span>
+          <span id="progress-text">正在处理</span>
+        </div>
+
+        <form class="composer" id="composer">
+          <label class="sr-only" for="message-input">输入问题</label>
+          <input
+            id="message-input"
+            name="message"
+            maxlength="500"
+            autocomplete="off"
+            placeholder="输入你的问题……"
+            required
+          >
+          <button class="send" id="send-button" type="submit">发送</button>
+        </form>
+        <p class="limit">单条消息最多 500 字；每分钟最多 20 条。</p>
+      </section>
+    </section>
+  </main>
+
+  <script src="/demo/app.js" defer></script>
+</body>
+</html>
