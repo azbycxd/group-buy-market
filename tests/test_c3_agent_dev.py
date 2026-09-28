@@ -13,15 +13,18 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import jwt
 from dotenv import dotenv_values
 
 from action_ledger import AgentActionStore
+from reconciler import reconcile_stuck_actions
 from tests.test_b2 import collect_sse, free_port, stop_process, wait_for_port
 
 
@@ -154,6 +157,9 @@ class _RefundRecordingProxy:
         self.refund_keys: list[str] = []
         self.result_keys: list[str] = []
         self._refund_requests = 0
+        self.refund_received = threading.Event()
+        self.refund_forwarded = threading.Event()
+        self.release_refund = threading.Event()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -164,11 +170,17 @@ class _RefundRecordingProxy:
                     body = json.loads(raw_body)
                     owner.refund_keys.append(str(body["idempotencyKey"]))
                     owner._refund_requests += 1
+                    owner.refund_received.set()
                     if (
                         owner.refund_delay_mode == "before_forward"
                         and owner._refund_requests == 1
                     ):
                         time.sleep(owner.delay_seconds)
+                    if (
+                        owner.refund_delay_mode == "before_forward_hold"
+                        and owner._refund_requests == 1
+                    ):
+                        owner.release_refund.wait(timeout=20)
                 elif self.path == "/api/v1/agent/order/refund/result":
                     body = json.loads(raw_body)
                     owner.result_keys.append(str(body["idempotencyKey"]))
@@ -183,19 +195,30 @@ class _RefundRecordingProxy:
                         content=raw_body,
                         headers=forwarded_headers,
                     )
+                if self.path == "/api/v1/agent/order/refund":
+                    owner.refund_forwarded.set()
                 if (
                     self.path == "/api/v1/agent/order/refund"
                     and owner.refund_delay_mode == "after_forward"
                     and owner._refund_requests == 1
                 ):
                     time.sleep(owner.delay_seconds)
-                self.send_response(response.status_code)
-                self.send_header("Content-Type", response.headers.get(
-                    "content-type", "application/json"
-                ))
-                self.send_header("Content-Length", str(len(response.content)))
-                self.end_headers()
+                if (
+                    self.path == "/api/v1/agent/order/refund"
+                    and owner.refund_delay_mode == "after_forward_hold"
+                    and owner._refund_requests == 1
+                ):
+                    owner.release_refund.wait(timeout=20)
                 try:
+                    self.send_response(response.status_code)
+                    self.send_header("Content-Type", response.headers.get(
+                        "content-type", "application/json"
+                    ))
+                    self.send_header(
+                        "Content-Length",
+                        str(len(response.content)),
+                    )
+                    self.end_headers()
                     self.wfile.write(response.content)
                 except OSError:
                     pass
@@ -213,6 +236,7 @@ class _RefundRecordingProxy:
         self.thread.start()
 
     def close(self) -> None:
+        self.release_refund.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -585,6 +609,121 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
             second_response.json()["message"],
         )
         self.assertNotIn("退款失败", second_response.json()["message"])
+
+    def _kill_and_reconcile(
+        self,
+        *,
+        delay_mode: str,
+    ) -> tuple[dict[str, Any], dict[str, int], _RefundRecordingProxy]:
+        proxy = _RefundRecordingProxy(
+            REAL_JAVA_BASE_URL,
+            refund_delay_mode=delay_mode,
+        )
+        proxy.start()
+        self._restart_api(
+            f"http://127.0.0.1:{proxy.port}",
+            refund_timeout=10.0,
+        )
+        event, action, _ = self._proposal(
+            "agent_c3_unpaid",
+            "930000000001",
+        )
+        action_path = self.action_path
+        store = AgentActionStore(action_path)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self._confirm,
+            event,
+            "agent_c3_unpaid",
+            timeout=30,
+        )
+        synchronization = (
+            proxy.refund_forwarded
+            if delay_mode == "after_forward_hold"
+            else proxy.refund_received
+        )
+        self.assertTrue(synchronization.wait(timeout=15))
+        executing = store.get_action(str(action["action_id"]))
+        self.assertEqual(executing["status"], "EXECUTING")
+        self._stop_api()
+        environment = {
+            "AGENT_ACTION_DB_PATH": str(action_path),
+            "JAVA_BASE_URL": f"http://127.0.0.1:{proxy.port}",
+            "JAVA_REFUND_RESULT_TIMEOUT_SECONDS": "5",
+        }
+        with patch.dict(os.environ, environment):
+            summary = reconcile_stuck_actions(
+                now=datetime.now(timezone.utc),
+                min_age=0,
+            )
+        proxy.release_refund.set()
+        try:
+            future.result(timeout=10)
+        except Exception:
+            pass
+        executor.shutdown(wait=True)
+        final = store.get_action(str(action["action_id"]))
+        return final, summary, proxy
+
+    def test_9_kill_after_java_execution_reconciles_success(self) -> None:
+        proxy: _RefundRecordingProxy | None = None
+        try:
+            final, summary, proxy = self._kill_and_reconcile(
+                delay_mode="after_forward_hold",
+            )
+            self.assertEqual(summary["succeeded"], 1)
+            self.assertEqual(final["status"], "SUCCEEDED")
+            self.assertEqual(final["result_code"], "REFUND_SUCCEEDED")
+            self.assertEqual(final["refund_executed"], 1)
+            self.assertEqual(len(proxy.refund_keys), 1)
+            self.assertEqual(proxy.result_keys, [final["idempotency_key"]])
+            self.assertEqual(
+                _mysql_scalar(
+                    "SELECT status FROM group_buy_order_list "
+                    "WHERE out_trade_no='930000000001'"
+                ),
+                "2",
+            )
+            self.assertEqual(
+                _mysql_scalar("SELECT COUNT(*) FROM notify_task"),
+                "1",
+            )
+        finally:
+            if proxy is not None:
+                proxy.close()
+            self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
+
+    def test_10_kill_before_java_receives_refund_abandons(self) -> None:
+        proxy: _RefundRecordingProxy | None = None
+        try:
+            final, summary, proxy = self._kill_and_reconcile(
+                delay_mode="before_forward_hold",
+            )
+            time.sleep(0.5)
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(final["status"], "FAILED")
+            self.assertEqual(
+                final["result_code"],
+                "NOT_RECEIVED_BEFORE_QUERY",
+            )
+            self.assertEqual(final["refund_executed"], 0)
+            self.assertEqual(len(proxy.refund_keys), 1)
+            self.assertEqual(proxy.result_keys, [final["idempotency_key"]])
+            self.assertEqual(
+                _mysql_scalar(
+                    "SELECT status FROM group_buy_order_list "
+                    "WHERE out_trade_no='930000000001'"
+                ),
+                "0",
+            )
+            self.assertEqual(
+                _mysql_scalar("SELECT COUNT(*) FROM notify_task"),
+                "0",
+            )
+        finally:
+            if proxy is not None:
+                proxy.close()
+            self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
 
 
 if __name__ == "__main__":

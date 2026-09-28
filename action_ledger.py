@@ -29,6 +29,7 @@ class ActionStatus(StrEnum):
 
 ALLOWED_TRANSITIONS = {
     (ActionStatus.PROPOSED, ActionStatus.CONFIRMED),
+    (ActionStatus.CONFIRMED, ActionStatus.FAILED),
     (ActionStatus.CONFIRMED, ActionStatus.EXECUTING),
     (ActionStatus.EXECUTING, ActionStatus.UNKNOWN),
     (ActionStatus.EXECUTING, ActionStatus.SUCCEEDED),
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS agent_action (
     version INTEGER NOT NULL,
     result_code TEXT,
     refund_executed INTEGER,
+    reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+    needs_manual INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
@@ -79,6 +82,14 @@ AGENT_ACTION_MIGRATIONS = {
     "result_code": "ALTER TABLE agent_action ADD COLUMN result_code TEXT",
     "refund_executed": (
         "ALTER TABLE agent_action ADD COLUMN refund_executed INTEGER"
+    ),
+    "reconcile_attempts": (
+        "ALTER TABLE agent_action "
+        "ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0"
+    ),
+    "needs_manual": (
+        "ALTER TABLE agent_action "
+        "ADD COLUMN needs_manual INTEGER NOT NULL DEFAULT 0"
     ),
 }
 
@@ -394,3 +405,73 @@ class AgentActionStore:
                 "SELECT * FROM agent_action ORDER BY created_at, action_id"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_stuck_actions(
+        self,
+        *,
+        before: datetime,
+    ) -> list[dict[str, Any]]:
+        cutoff = _timestamp(before)
+        with closing(self._connect()) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_action
+                WHERE status IN ('CONFIRMED', 'EXECUTING', 'UNKNOWN')
+                  AND updated_at < ?
+                  AND needs_manual = 0
+                ORDER BY updated_at, action_id
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_unknown_reconcile_attempt(
+        self,
+        *,
+        action_id: str,
+        expected_version: int,
+        max_attempts: int,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts 必须大于 0")
+        now_text = _timestamp(now or _utc_now())
+        with closing(self._connect()) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE agent_action
+                    SET reconcile_attempts = reconcile_attempts + 1,
+                        needs_manual = CASE
+                            WHEN reconcile_attempts + 1 >= ? THEN 1
+                            ELSE needs_manual
+                        END,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE action_id = ?
+                      AND status = 'UNKNOWN'
+                      AND version = ?
+                      AND needs_manual = 0
+                    """,
+                    (
+                        max_attempts,
+                        now_text,
+                        action_id,
+                        expected_version,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM agent_action WHERE action_id = ?",
+                    (action_id,),
+                ).fetchone()
+                connection.commit()
+                return dict(row) if row is not None else None
+            except Exception:
+                connection.rollback()
+                raise

@@ -40,6 +40,7 @@ from confirmation_workflow import (
     create_async_confirmation_workflow,
 )
 from outcome import AgentOutcome, OutcomeKind
+from reconciler import reconcile_stuck_actions
 from session_locks import SessionLockRegistry
 from session_ownership import SessionOwnershipStore
 from tools.context import AgentContext
@@ -48,6 +49,7 @@ from tools.context import AgentContext
 logger = logging.getLogger("uvicorn.error")
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 25.0
 DISCONNECT_POLL_SECONDS = 0.1
+RECONCILE_INTERVAL_SECONDS = 30.0
 JWT_ALGORITHM = "HS256"
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -440,6 +442,18 @@ async def _cancel_task(
     _record_execution(app, session_id, request_id, "cancelled")
 
 
+async def _reconciler_loop() -> None:
+    while True:
+        await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
+        try:
+            summary = await asyncio.to_thread(reconcile_stuck_actions)
+            logger.info("refund_reconcile_completed summary=%s", summary)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("refund_reconcile_failed")
+
+
 def create_app(
     *,
     checkpoint_path: str | Path | None = None,
@@ -474,9 +488,16 @@ def create_app(
                 app.state.session_ownership = await SessionOwnershipStore.open(
                     selected_checkpoint
                 )
+                app.state.reconciler_task = asyncio.create_task(
+                    _reconciler_loop(),
+                    name="refund-action-reconciler",
+                )
                 try:
                     yield
                 finally:
+                    app.state.reconciler_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await app.state.reconciler_task
                     await app.state.session_ownership.close()
             finally:
                 await close_async_confirmation_workflow(
