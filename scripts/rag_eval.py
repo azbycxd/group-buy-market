@@ -176,6 +176,7 @@ def build_report(
     *,
     evaluated: list[CaseResult],
     chunks: list[RuleChunk],
+    internal_count: int,
     k1: float,
     b: float,
 ) -> str:
@@ -191,9 +192,12 @@ def build_report(
     ]
 
     lines = [
-        f"## {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        (
+            "## D1.1 客服业务规则 baseline — "
+            f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+        ),
         "",
-        f"- 规则数：{len(chunks)}",
+        f"- 规则数：public={len(chunks)}，internal={internal_count}",
         f"- Eval：{len(evaluated)}（answerable={len(answerable)}，unanswerable={len(unanswerable)}）",
         f"- BM25 参数：k1={k1}，b={b}",
         "",
@@ -249,7 +253,11 @@ def main() -> None:
     parser.add_argument("--b", type=float, default=0.75)
     arguments = parser.parse_args()
 
-    chunks = load_rule_chunks(arguments.rules)
+    all_rules = load_rule_chunks(arguments.rules, include_internal=True)
+    chunks = [rule for rule in all_rules if rule.visibility == "public"]
+    internal_count = sum(
+        rule.visibility == "internal" for rule in all_rules
+    )
     cases = load_cases(arguments.cases)
     known_rule_ids = {chunk.rule_id for chunk in chunks}
     unknown_gold = sorted(
@@ -268,6 +276,7 @@ def main() -> None:
     report = build_report(
         evaluated=evaluated,
         chunks=chunks,
+        internal_count=internal_count,
         k1=arguments.k1,
         b=arguments.b,
     )

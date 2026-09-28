@@ -1,92 +1,92 @@
-- id: act_not_started_join
-  query: "活动还没开呢，我现在先去占个名额行不行？"
+- id: activity_not_active
+  query: "页面还说活动没开始，我能不能先拼上？"
   gold_rule_ids: [ACT-002]
-- id: act_boundary_second
-  query: "刚好卡在开场或收场那一秒，还算能参加吗？"
+- id: activity_boundary_time
+  query: "活动八点结束，我八点整点进去还算有效吗？"
   gold_rule_ids: [ACT-003]
-- id: act_effective_means_open
-  query: "后台写着生效，是不是就代表此刻肯定在报名时间里？"
+- id: activity_effective_but_closed
+  query: "活动明明显示生效，怎么现在还是参加不了？"
   gold_rule_ids: [ACT-004]
-- id: act_new_team_deadline
-  query: "我刚发起一队，这队的截止点是从哪一刻往后算的？"
+- id: new_team_expiry
+  query: "我刚开的团能留多久，截止时间怎么算呀？"
   gold_rule_ids: [ACT-005]
-- id: eligibility_count_basis
-  query: "一个人在同个活动玩过几回，系统到底拿什么记录来数？"
+- id: participation_count
+  query: "同一个活动我到底参加过几回，平台是怎么数的？"
   gold_rule_ids: [ELG-001]
-- id: eligibility_closed_still_counts
-  query: "之前那单都退掉关掉了，还会占我的参与次数吗？"
+- id: closed_order_uses_quota
+  query: "之前那笔我都取消了，怎么还占着活动次数？"
   gold_rule_ids: [ELG-002]
-- id: eligibility_limit_blocks
-  query: "我以前下的单已经把次数用满，这回还能继续占坑吗？"
+- id: participation_limit
+  query: "提示次数用光了，我还能再跟一次团吗？"
   gold_rule_ids: [ELG-004]
-- id: eligibility_crowd_cache_missing
-  query: "圈选人群的缓存数据没了，当前实现会直接把人拦住吗？"
-  gold_rule_ids: [ELG-007]
-- id: eligibility_downgrade_traffic
-  query: "系统降级了，或者我没进灰度流量，会怎么处理试算？"
-  gold_rule_ids: [ELG-010]
-- id: team_new_initial_values
-  query: "自己新拉一队时，人数计数和队伍状态一开始分别是什么？"
+- id: no_audience_restriction
+  query: "这个活动没写专享人群，是不是大家默认都能参加？"
+  gold_rule_ids: [ELG-005]
+- id: audience_visibility
+  query: "朋友能看到活动入口，我这边完全没有，是人群限制吗？"
+  gold_rule_ids: [ELG-008]
+- id: audience_participation
+  query: "活动我看得到，但点参团说没资格，这是怎么回事？"
+  gold_rule_ids: [ELG-009]
+- id: new_team_initial_state
+  query: "我刚发起拼团，为什么显示只有一个占位，还没人付款？"
   gold_rule_ids: [TEAM-002]
-- id: team_concurrent_last_slot
-  query: "只剩最后一个坑时两个人一起挤，会不会把队伍挤超员？"
+- id: team_last_slot
+  query: "只剩最后一个位置时两个人都点加入，会不会超出人数？"
   gold_rule_ids: [TEAM-003]
-- id: team_can_still_join
-  query: "别人的队满足哪些条件，才会被当成现在还能进去的队？"
+- id: joinable_team_conditions
+  query: "什么样的别人队伍才会出现在可以加入的列表里？"
   gold_rule_ids: [TEAM-005]
-- id: team_hide_own
-  query: "系统推荐能加入的队时，会不会把我自己开的那队也推给我？"
+- id: own_team_not_recommended
+  query: "找可加入的团时，系统会把我自己的团也推荐回来吗？"
   gold_rule_ids: [TEAM-006]
-- id: team_recommend_limit
-  query: "可选队伍一次最多给我看几个？为啥有时还不到这个数？"
+- id: joinable_team_display_count
+  query: "可加入的队一次最多展示几个，怎么有时只有一个？"
   gold_rule_ids: [TEAM-007]
-- id: team_stats_vs_joinable
-  query: "看板显示有好几个团，就等于眼下真有这么多团能挤进去吗？"
+- id: team_total_not_joinable
+  query: "活动说有很多团，为啥我这边一个能加入的都没有？"
   gold_rule_ids: [TEAM-008]
-- id: order_state_meanings
-  query: "用户这笔拼单从刚建好到付完再到退掉，各用什么状态表示？"
+- id: order_status_meaning
+  query: "订单上的待支付、已完成和已关闭分别代表啥？"
   gold_rule_ids: [ORD-001]
-- id: order_trade_number_privacy
-  query: "我只知道一串外部交易号，能不能顺手查到别人的订单？"
+- id: new_order_unpaid
+  query: "我已经参团成功但还没付款，这时订单算支付完成了吗？"
+  gold_rule_ids: [ORD-002]
+- id: order_owner_privacy
+  query: "拿到别人的交易号，能查到他的拼团订单详情吗？"
   gold_rule_ids: [ORD-003]
-- id: order_closed_pay
-  query: "这单已经关了，我还能补一次付款把它救回来吗？"
+- id: closed_order_payment
+  query: "订单已经关掉了，还能重新把钱付上吗？"
   gold_rule_ids: [ORD-004]
-- id: order_settlement_transition
-  query: "付款结算落库时，订单是从哪个阶段切到哪个阶段？"
-  gold_rule_ids: [ORD-005]
-- id: order_last_payer_team
-  query: "最后差的那个人付完以后，团是在什么时候被改成完成的？"
+- id: last_member_paid
+  query: "最后一个人付完款以后，这个团什么时候算拼成？"
   gold_rule_ids: [ORD-006]
-- id: timeout_scan_candidates
-  query: "定时清理会捞哪些一直没付钱的单，付过的也会被捞吗？"
+- id: unpaid_timeout_scope
+  query: "我已经付过钱的订单，还会被当成超时未付款处理吗？"
   gold_rule_ids: [TMO-001]
-- id: timeout_uses_team_clock
-  query: "判定没付款超时时，看个人订单的截止点，还是整队的截止点？"
+- id: unpaid_timeout_deadline
+  query: "没付款多久会被关单，是看我下单时间还是团的截止时间？"
   gold_rule_ids: [TMO-002]
-- id: timeout_job_switch_frequency
-  query: "自动处理逾期未付款的活儿能停掉吗，平常多久跑一趟？"
-  gold_rule_ids: [TMO-004]
-- id: preview_read_only
-  query: "我只是先看一下能不能退，这一步会不会已经改订单或发消息？"
+- id: preview_does_not_execute
+  query: "我只想先看看能不能退，点预览不会直接把单退了吧？"
   gold_rule_ids: [PRE-001]
-- id: preview_closed_again
-  query: "一笔已经关闭的单，还会再给我生成一个可确认的退款方案吗？"
+- id: closed_no_new_proposal
+  query: "订单都已经关闭了，还能再生成一次退款申请吗？"
   gold_rule_ids: [PRE-002]
-- id: preview_formed_review
-  query: "钱付了而且团也成了，这种退单能让系统自动办，还是得找人审？"
+- id: unpaid_cancel_proposal
+  query: "团还没拼成，我也没付款，现在取消需要人工审核吗？"
+  gold_rule_ids: [PRE-003]
+- id: formed_refund_review
+  query: "钱付了而且团也成了，我申请退款是不是得人工处理？"
   gold_rule_ids: [PRE-005]
-- id: preview_two_versions
-  query: "提交退款确认前只盯订单有没有变化够不够，队伍变化算不算？"
+- id: proposal_changed_state
+  query: "退款方案出来后订单情况变了，还能按原来的继续确认吗？"
   gold_rule_ids: [PRE-007]
-- id: refund_repeat_closed
-  query: "同一个单已经退成关闭了，再来一遍执行链会重复动账吗？"
+- id: no_duplicate_refund
+  query: "这笔单已经退成关闭，再点一次会不会重复退款？"
   gold_rule_ids: [RFD-002]
-- id: refund_formed_team_effect
-  query: "成团以后有人退掉，队伍最终会被改成失败还是别的状态？"
-  gold_rule_ids: [RFD-005]
-- id: refund_close_not_arrival
-  query: "页面上订单已经关了，能不能据此认定银行卡里已经收到退款？"
+- id: close_not_money_arrived
+  query: "订单显示关闭，是不是银行卡里肯定已经收到退款了？"
   gold_rule_ids: [RFD-007]
 - id: no_rule_shipping
   query: "这个拼团买下来给不给包邮呀？"

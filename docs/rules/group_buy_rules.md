@@ -1,13 +1,13 @@
-# 拼团规则知识库
+# 拼团客服业务规则知识库
 
-本文件由 `docs/rules/java_rule_source.md` 中的 48 条 Java 事实规则机械整理而来，不增加源码没有依据的业务规则。
-
+本文件基于 `docs/rules/java_rule_source.md` 改写。`content` 仅表达用户可理解的业务规则；`source` 只用于追溯 Java 依据，不参与检索，也不得直接提供给用户。
 
 ## ACT-001
 - rule_id: `ACT-001`
 - section: 活动状态与有效期
-- title: 活动状态枚举
-- content: 拼团活动状态只有 `CREATE`（0，创建）、`EFFECTIVE`（1，生效）、`OVERDUE`（2，过期）、`ABANDONED`（3，废弃）四种 Java 枚举值。
+- title: 活动可能处于哪些状态
+- content: 活动可能处于创建、生效、过期或已废弃状态；只有处于生效状态的活动才具备继续参与的基础条件。
+- visibility: public
 - source:
   - 类 / 方法：`group-buy-market-types/.../ActivityStatusEnumVO.java#valueOf(Integer)`
   - 枚举 / 字段：`ActivityStatusEnumVO.CREATE/EFFECTIVE/OVERDUE/ABANDONED`
@@ -16,8 +16,9 @@
 ## ACT-002
 - rule_id: `ACT-002`
 - section: 活动状态与有效期
-- title: 锁单只接受生效活动
-- content: 创建或加入拼团并锁定订单前，活动状态必须为 `EFFECTIVE`；其他状态会被活动可用性规则拒绝。
+- title: 只有生效活动才能参团
+- content: 活动尚未生效、已经过期或已经废弃时，不能创建或加入拼团。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityUsabilityRuleFilter#apply`
   - 枚举 / 字段：要求 `ActivityStatusEnumVO.EFFECTIVE`，否则抛出 `E0101`
@@ -26,8 +27,9 @@
 ## ACT-003
 - rule_id: `ACT-003`
 - section: 活动状态与有效期
-- title: 活动有效期包含起止时刻
-- content: 当前时间早于 `startTime` 或晚于 `endTime` 时不可参与；因此恰好等于开始或结束时刻不被该规则判为超出有效期。
+- title: 活动起止时刻计入有效期
+- content: 恰好在活动开始或结束时刻仍视为处于有效期；早于开始时间或晚于结束时间则不能参加。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityUsabilityRuleFilter#apply`；`AgentActivityFactsService#getActivityFacts`
   - 枚举 / 字段：`startTime`、`endTime`、`withinValidTime`
@@ -36,8 +38,9 @@
 ## ACT-004
 - rule_id: `ACT-004`
 - section: 活动状态与有效期
-- title: 活动事实查询不把状态和时间混成一个结论
-- content: Activity Facts 按 `activityId` 读取活动原始状态、开始和结束时间，并由 Java 独立计算 `withinValidTime`；`status=EFFECTIVE` 不自动等于当前处于有效时间内。
+- title: 活动生效不等于当前可参加
+- content: 活动状态显示为生效，只说明活动没有被停用；当前能否参加还要单独确认是否处于活动开放时间内。
+- visibility: public
 - source:
   - 类 / 方法：`AgentActivityFactsService#getActivityFacts`；`ActivityRepository#queryGroupBuyActivityFactsSourceByActivityId`
   - 枚举 / 字段：`ActivityFactsVO.status/startTime/endTime/evaluatedAt/withinValidTime`
@@ -46,8 +49,9 @@
 ## ACT-005
 - rule_id: `ACT-005`
 - section: 活动状态与有效期
-- title: 新团队有效期由活动拼团时长产生
-- content: 新开团队时，`validStartTime` 取创建时刻，`validEndTime` 等于创建时刻加活动配置的 `validTime` 分钟。
+- title: 新团截止时间如何确定
+- content: 新团从创建时开始计时，截止时间由活动设置的拼团时长决定。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#lockMarketPayOrder`
   - 枚举 / 字段：`PayActivityEntity.validTime`、`GroupBuyOrder.validStartTime/validEndTime`
@@ -56,8 +60,9 @@
 ## ACT-006
 - rule_id: `ACT-006`
 - section: 活动状态与有效期
-- title: 生效活动配置查询仍需独立时间校验
-- content: 按活动 ID 查询可用营销配置时，Mapper 只筛选 `status=1`，没有筛选开始或结束时间；锁单链路随后仍会执行独立的时间范围校验。
+- title: 活动可用性需要完整校验
+- content: 系统找到生效活动后，仍会继续确认当前时间是否处于活动期限内。
+- visibility: internal
 - source:
   - 类 / 方法：`ActivityRepository#queryGroupBuyActivityDiscountVO`；`ActivityUsabilityRuleFilter#apply`
   - 枚举 / 字段：`ActivityStatusEnumVO.EFFECTIVE`
@@ -66,8 +71,9 @@
 ## ELG-001
 - rule_id: `ELG-001`
 - section: 用户参与次数、人群资格与流量开关
-- title: 用户参与次数按活动订单记录计数
-- content: 用户在活动中的参与次数，是 `group_buy_order_list` 中该 `userId + activityId` 的记录总数。
+- title: 参与次数如何计算
+- content: 同一用户在同一活动下产生的每一笔拼团订单，都会计入该活动的参与次数。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityRepository#queryOrderCountByActivityId`；`TradeRepository#queryOrderCountByActivityId`
   - 枚举 / 字段：`EligibilityFactsVO.userTakeCount`
@@ -76,8 +82,9 @@
 ## ELG-002
 - rule_id: `ELG-002`
 - section: 用户参与次数、人群资格与流量开关
-- title: 已关闭订单仍计入参与次数
-- content: 当前参与次数 SQL 没有状态过滤，所以 `CREATE`、`COMPLETE`、`CLOSE` 订单记录都计入活动参与次数。
+- title: 已关闭订单仍占参与次数
+- content: 已经取消或关闭的拼团订单仍会计入活动参与次数，不会因为订单关闭而自动返还次数。
+- visibility: public
 - source:
   - 类 / 方法：`IGroupBuyOrderListDao#queryOrderCountByActivityId`
   - 枚举 / 字段：订单状态字段 `group_buy_order_list.status`
@@ -86,8 +93,9 @@
 ## ELG-003
 - rule_id: `ELG-003`
 - section: 用户参与次数、人群资格与流量开关
-- title: 参与上限达到条件
-- content: 当活动 `takeLimitCount` 非空，且用户参与次数大于或等于该上限时，`participationLimitReached=true`。
+- title: 何时算参与次数已用完
+- content: 活动设置了参与上限时，用户已参与次数达到或超过上限，就视为次数已经用完。
+- visibility: public
 - source:
   - 类 / 方法：`AgentEligibilityFactsService#getEligibilityFacts`
   - 枚举 / 字段：`userTakeCount`、`userTakeLimit`、`participationLimitReached`
@@ -96,8 +104,9 @@
 ## ELG-004
 - rule_id: `ELG-004`
 - section: 用户参与次数、人群资格与流量开关
-- title: 达到参与上限会阻止锁单
-- content: 锁单规则中，活动参与上限非空且计数已达到上限时会抛出 `E0103`，不会继续创建本次拼团订单。
+- title: 次数用完后不能继续参团
+- content: 用户的活动参与次数达到上限后，不能再创建或加入新的拼团订单。
+- visibility: public
 - source:
   - 类 / 方法：`UserTakeLimitRuleFilter#apply`
   - 枚举 / 字段：`GroupBuyActivityEntity.takeLimitCount`；`ResponseCode.E0103`
@@ -106,8 +115,9 @@
 ## ELG-005
 - rule_id: `ELG-005`
 - section: 用户参与次数、人群资格与流量开关
-- title: 未配置人群标签时默认通过标签门槛
-- content: 活动 `tagId` 为空时，标签规则视为未配置，标签门槛通过，活动可见且可参与。
+- title: 没有人群限制时默认可以参加
+- content: 活动没有设置专属人群时，普通用户默认可以看到并参与该活动，但仍需满足活动时间和次数等其他条件。
+- visibility: public
 - source:
   - 类 / 方法：`AgentEligibilityFactsService#getEligibilityFacts`；`TagNode#doApply`
   - 枚举 / 字段：`tagRuleConfigured=false`、`tagGatePassed=true`、`tagVisibilityAllowed=true`、`tagParticipationAllowed=true`
@@ -116,8 +126,9 @@
 ## ELG-006
 - rule_id: `ELG-006`
 - section: 用户参与次数、人群资格与流量开关
-- title: 人群数据可用性取决于 Redis BitSet
-- content: 配置了 `tagId` 后，`tagCrowdDataAvailable` 仅表示对应 Redis BitSet 是否存在，不代表当前用户一定属于该人群。
+- title: 人群资格数据是否可用
+- content: 系统会把人群规则是否配置、人群资格数据是否可用以及用户是否满足条件分别判断。
+- visibility: internal
 - source:
   - 类 / 方法：`AgentEligibilityFactsService#getEligibilityFacts`；`ActivityRepository#isTagCrowdDataAvailable`
   - 枚举 / 字段：`EligibilityFactsVO.tagCrowdDataAvailable`
@@ -126,8 +137,9 @@
 ## ELG-007
 - rule_id: `ELG-007`
 - section: 用户参与次数、人群资格与流量开关
-- title: 人群 BitSet 缺失时当前实现按通过处理
-- content: `tagId` 已配置但对应 Redis BitSet 不存在时，`isTagCrowdRange` 当前返回 `true`；因此资格事实会同时出现“人群数据不可用”和“标签门槛通过”。这只是当前实现事实，不应推导为已有真实人群成员证据。
+- title: 人群数据缺失时的内部兜底
+- content: 人群资格数据暂时缺失时，系统当前可能按通过处理；这种兜底不能证明用户确实属于目标人群。
+- visibility: internal
 - source:
   - 类 / 方法：`ActivityRepository#isTagCrowdRange`
   - 枚举 / 字段：`tagCrowdDataAvailable=false`、`tagGatePassed=true`
@@ -136,8 +148,9 @@
 ## ELG-008
 - rule_id: `ELG-008`
 - section: 用户参与次数、人群资格与流量开关
-- title: 标签作用域 1 限制可见性
-- content: `tagScope` 第一项为 `1` 时，基础可见性为拒绝；属于标签人群的用户可通过 `baseVisible || isWithin` 获得可见性。
+- title: 部分活动仅对指定人群可见
+- content: 活动可以限制展示范围；不属于指定人群的用户可能看不到活动入口。
+- visibility: public
 - source:
   - 类 / 方法：`GroupBuyActivityDiscountVO#isVisible`；`TagNode#doApply`
   - 枚举 / 字段：`TagScopeEnumVO.VISIBLE`；`group_buy_activity.tag_scope`
@@ -146,8 +159,9 @@
 ## ELG-009
 - rule_id: `ELG-009`
 - section: 用户参与次数、人群资格与流量开关
-- title: 标签作用域 2 限制参与资格
-- content: `tagScope` 仅为 `2`，或第二项为 `2` 时，基础参与权限为拒绝；属于标签人群的用户可通过 `baseEnable || isWithin` 获得参与权限。
+- title: 部分活动仅允许指定人群参加
+- content: 活动可以限制参与资格；用户即使看得到活动，也可能因为不属于指定人群而不能参团。
+- visibility: public
 - source:
   - 类 / 方法：`GroupBuyActivityDiscountVO#isEnable`；`TagNode#doApply`
   - 枚举 / 字段：`TagScopeEnumVO.ENABLE`；`group_buy_activity.tag_scope`
@@ -156,8 +170,9 @@
 ## ELG-010
 - rule_id: `ELG-010`
 - section: 用户参与次数、人群资格与流量开关
-- title: 降级与切量是独立的参与前置条件
-- content: 营销试算链路在降级开关开启时以 `E0003` 拒绝；未进入用户切量范围时以 `E0004` 拒绝。切量使用 `abs(userId.hashCode) % 100 <= cutRange` 判断。
+- title: 系统保护措施可能暂时阻止参与
+- content: 系统维护或流量保护期间，部分用户的活动试算可能被暂时拒绝。
+- visibility: internal
 - source:
   - 类 / 方法：`SwitchNode#doApply`；`DCCService#isDowngradeSwitch/isCutRange`
   - 枚举 / 字段：DCC `downgradeSwitch`（默认 0）、`cutRange`（默认 100）
@@ -166,8 +181,9 @@
 ## TEAM-001
 - rule_id: `TEAM-001`
 - section: 组队、成团与可加入条件
-- title: 团队状态枚举
-- content: 团队状态为 `PROGRESS`（0，拼单中）、`COMPLETE`（1，完成）、`FAIL`（2，失败）、`COMPLETE_FAIL`（3，完成但含退单）。
+- title: 拼团队伍可能处于哪些状态
+- content: 拼团队伍可能处于拼团中、已成团、拼团失败或成团后发生退单等状态。
+- visibility: public
 - source:
   - 类 / 方法：`GroupBuyOrderEnumVO#valueOf(Integer)`
   - 枚举 / 字段：`GroupBuyOrderEnumVO.PROGRESS/COMPLETE/FAIL/COMPLETE_FAIL`
@@ -176,8 +192,9 @@
 ## TEAM-002
 - rule_id: `TEAM-002`
 - section: 组队、成团与可加入条件
-- title: 新团队的初始人数与状态
-- content: 新开团队时 `completeCount=0`、`lockCount=1`、`targetCount` 来自活动目标人数，数据库插入状态固定为 `PROGRESS(0)`。
+- title: 新团创建后的初始状态
+- content: 新团创建后处于拼团中，发起人会先占用一个参团名额，已完成付款人数从零开始计算。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#lockMarketPayOrder`
   - 枚举 / 字段：`GroupBuyOrder.completeCount/lockCount/targetCount/status`
@@ -186,8 +203,9 @@
 ## TEAM-003
 - rule_id: `TEAM-003`
 - section: 组队、成团与可加入条件
-- title: 数据库层加入团队不能超过目标人数
-- content: 加入已有团队时，数据库只在 `lock_count < target_count` 时把锁单人数加 1；更新行数不为 1 会被视为团队已满或不可更新。
+- title: 满员团队不能继续加入
+- content: 团队剩余名额用完后不能再加入；系统不会让实际占用名额超过目标人数。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#lockMarketPayOrder`
   - 枚举 / 字段：`lockCount`、`targetCount`；失败码 `E0005`
@@ -196,8 +214,9 @@
 ## TEAM-004
 - rule_id: `TEAM-004`
 - section: 组队、成团与可加入条件
-- title: 已有团队先占用 Redis 团队库存
-- content: 指定 `teamId` 加团时会按活动目标人数和拼团时长占用 Redis 团队库存；新开团因尚无 `teamId`，跳过该已有团队库存占用步骤。
+- title: 加入已有团队前会预留名额
+- content: 加入已有团队时，系统会先确认并预留可用名额，以避免同一名额被重复占用。
+- visibility: internal
 - source:
   - 类 / 方法：`TeamStockOccupyRuleFilter#apply`；`TradeRepository#occupyTeamStock`
   - 枚举 / 字段：`target`、`validTime`、`teamStockKey/recoveryTeamStockKey`
@@ -206,8 +225,9 @@
 ## TEAM-005
 - rule_id: `TEAM-005`
 - section: 组队、成团与可加入条件
-- title: 候选团队必须进行中、有空位且未过团队有效期
-- content: Joinable Team 候选的团队记录必须同时满足 `status=PROGRESS`、`target_count > lock_count`、`valid_end_time > now()`。
+- title: 什么团队可以继续加入
+- content: 可加入团队必须仍在拼团中、还有剩余名额，并且没有超过该团队的截止时间。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityRepository#queryInProgressUserGroupBuyOrderDetailListByRandom`
   - 枚举 / 字段：`GroupBuyOrderEnumVO.PROGRESS`、`targetCount/lockCount/validEndTime`
@@ -216,8 +236,9 @@
 ## TEAM-006
 - rule_id: `TEAM-006`
 - section: 组队、成团与可加入条件
-- title: Joinable Team 不返回当前用户自己的队伍记录
-- content: 随机候选来源排除 `user_id = authenticatedUserId`，且只考虑订单状态为 `CREATE` 或 `COMPLETE`、订单 `end_time` 尚未到期并属于进行中团队的记录。
+- title: 可加入列表不会推荐自己的队伍
+- content: 系统提供可加入团队时，会排除当前用户自己创建或已经参加的队伍。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityRepository#queryInProgressUserGroupBuyOrderDetailListByRandom`
   - 枚举 / 字段：订单状态 0/1；调用参数使用认证用户 ID
@@ -226,8 +247,9 @@
 ## TEAM-007
 - rule_id: `TEAM-007`
 - section: 组队、成团与可加入条件
-- title: Agent 最多返回两个随机可加入团队
-- content: Joinable Team Facts 不返回用户自己的团队，候选上限固定为 2；仓储先最多取 4 条候选记录，随机打乱后截取 2 条，再进行团队有效性过滤，因此最终也可能少于 2 条。
+- title: 可加入团队最多展示两个
+- content: 系统一次最多展示两个可加入团队；如果符合条件的团队不足，实际展示数量会更少。
+- visibility: public
 - source:
   - 类 / 方法：`AgentJoinableTeamFactsService#getJoinableTeamFacts`；`ActivityRepository#queryInProgressUserGroupBuyOrderDetailListByRandom`
   - 枚举 / 字段：`CANDIDATE_TEAM_LIMIT=2`、`ownerCount=0`
@@ -236,8 +258,9 @@
 ## TEAM-008
 - rule_id: `TEAM-008`
 - section: 组队、成团与可加入条件
-- title: 团队统计口径不是可加入候选口径
-- content: 团队统计先从活动下状态为 0/1 的订单记录按 `team_id` 分组得到团队集合，再统计团队总数、状态为完成的团队数和这些团队的 `lock_count` 总和；该统计没有团队有效期或剩余名额过滤。
+- title: 团队统计不等于可加入数量
+- content: 活动页面的团队总数是统计口径，不代表这些团队当前都有空位或仍在有效期内，因此不能直接当作可加入团队数量。
+- visibility: public
 - source:
   - 类 / 方法：`ActivityRepository#queryTeamStatisticByActivityId`
   - 枚举 / 字段：`TeamStatisticVO.allTeamCount/allTeamCompleteCount/allTeamUserCount`
@@ -246,8 +269,9 @@
 ## ORD-001
 - rule_id: `ORD-001`
 - section: 订单状态与支付结算
-- title: 拼团订单明细状态枚举
-- content: 用户订单状态为 `CREATE`（0，初始创建）、`COMPLETE`（1，消费完成）、`CLOSE`（2，用户退单）。
+- title: 拼团订单可能处于哪些状态
+- content: 用户拼团订单可能处于待支付、已支付完成或已关闭退单状态。
+- visibility: public
 - source:
   - 类 / 方法：`TradeOrderStatusEnumVO#valueOf(Integer)`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CREATE/COMPLETE/CLOSE`
@@ -256,8 +280,9 @@
 ## ORD-002
 - rule_id: `ORD-002`
 - section: 订单状态与支付结算
-- title: 锁单创建 CREATE 订单
-- content: 锁定营销订单时新增的 `group_buy_order_list` 记录状态为 `CREATE`；此时只是订单已创建，不表示支付完成。
+- title: 刚参团的订单仍待支付
+- content: 创建或加入拼团后，新订单先处于待支付状态；订单创建成功不代表已经付款。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#lockMarketPayOrder`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CREATE`
@@ -266,8 +291,9 @@
 ## ORD-003
 - rule_id: `ORD-003`
 - section: 订单状态与支付结算
-- title: 用户订单事实按用户和外部交易号联合查询
-- content: Order Facts、退款预检和退款数据加载都通过 `userId + outTradeNo` 定位订单；仅有交易号不能读取其他用户订单。
+- title: 订单查询受用户身份保护
+- content: 查询订单时会同时核对登录用户和交易号；只知道交易号也不能查看其他用户的订单。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#queryMarketPayOrderEntityByOutTradeNo`；`OrderFactsService#getOrderFacts`；`RefundPreviewService#getRefundPreview`
   - 枚举 / 字段：`MarketPayOrderEntity.teamId/orderId/status/updateTime`
@@ -276,8 +302,9 @@
 ## ORD-004
 - rule_id: `ORD-004`
 - section: 订单状态与支付结算
-- title: 不存在或已关闭订单不能进行支付结算
-- content: 支付结算前若订单不存在或已是 `CLOSE`，结算规则以 `E0104` 拒绝。
+- title: 已关闭订单不能继续支付
+- content: 订单不存在或已经关闭时，不能再进行支付结算。
+- visibility: public
 - source:
   - 类 / 方法：`OutTradeNoRuleFilter#apply`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CLOSE`；`ResponseCode.E0104`
@@ -286,8 +313,9 @@
 ## ORD-005
 - rule_id: `ORD-005`
 - section: 订单状态与支付结算
-- title: 支付结算只把 CREATE 更新为 COMPLETE
-- content: 支付结算把订单从 `CREATE` 更新为 `COMPLETE` 并写入支付时间；只有原状态为 0 时更新成功，更新行数不为 1 会使事务失败。
+- title: 付款完成后订单状态更新
+- content: 待支付订单完成付款后会变为已支付完成，并记录付款时间；已经不是待支付状态的订单不能重复结算。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#settlementMarketPayOrder`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CREATE/COMPLETE`、`outTradeTime`
@@ -296,8 +324,9 @@
 ## ORD-006
 - rule_id: `ORD-006`
 - section: 订单状态与支付结算
-- title: 最后一笔支付完成团队
-- content: 每次支付结算先将团队 `complete_count` 加 1；当结算前 `targetCount - completeCount == 1` 时，再把进行中的团队状态更新为 `COMPLETE` 并创建成团通知任务。
+- title: 最后一人付款后完成拼团
+- content: 当最后一个所需成员完成付款后，团队会变为已成团，并进入后续成团通知流程。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRepository#settlementMarketPayOrder`
   - 枚举 / 字段：`GroupBuyOrderEnumVO.PROGRESS/COMPLETE`、`targetCount/completeCount`
@@ -306,8 +335,9 @@
 ## TMO-001
 - rule_id: `TMO-001`
 - section: 超时未支付订单
-- title: 超时扫描只选择未支付 CREATE 订单
-- content: 超时扫描仅选择订单状态为 `CREATE` 且 `out_trade_time is null` 的订单。
+- title: 超时处理只针对未付款订单
+- content: 系统的超时处理只针对仍处于待支付且没有付款记录的订单，已付款订单不会按未支付超时处理。
+- visibility: public
 - source:
   - 类 / 方法：`TradeRefundOrderService#queryTimeoutUnpaidOrderList`；`TradeRepository#queryTimeoutUnpaidOrderList`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CREATE`、`outTradeTime`
@@ -316,8 +346,9 @@
 ## TMO-002
 - rule_id: `TMO-002`
 - section: 超时未支付订单
-- title: 超时判断使用团队有效结束时间
-- content: 当前生效的超时 SQL 使用 `group_buy_order.valid_end_time` 判断是否超时，不使用订单明细自己的 `end_time`。
+- title: 未付款超时以团队截止时间为准
+- content: 未付款订单是否超时，按所属拼团队伍的截止时间判断。
+- visibility: public
 - source:
   - 类 / 方法：`IGroupBuyOrderListDao#queryTimeoutUnpaidOrderList`
   - 枚举 / 字段：`GroupBuyOrder.validEndTime`
@@ -326,8 +357,9 @@
 ## TMO-003
 - rule_id: `TMO-003`
 - section: 超时未支付订单
-- title: 单批超时扫描上限为十条
-- content: 每次超时未支付订单查询最多返回 10 条。
+- title: 超时订单分批处理
+- content: 系统会分批处理超时未付款订单，每批最多处理十笔。
+- visibility: internal
 - source:
   - 类 / 方法：`IGroupBuyOrderListDao#queryTimeoutUnpaidOrderList`
   - 枚举 / 字段：无
@@ -336,8 +368,9 @@
 ## TMO-004
 - rule_id: `TMO-004`
 - section: 超时未支付订单
-- title: 超时任务复用真实退款服务并受任务开关控制
-- content: 超时任务取得分布式锁后逐条调用 `tradeRefundOrderService.refundOrder`；任务由 `group-buy-market.jobs.timeout-refund.enabled` 控制，缺省为启用，调度表达式为每分钟一次。
+- title: 超时订单由后台定期处理
+- content: 系统会定期检查并处理超时未付款订单，该后台处理可以由运维配置启停。
+- visibility: internal
 - source:
   - 类 / 方法：`TimeoutRefundJob#exec`
   - 枚举 / 字段：Redis 锁 `group_buy_market_timeout_refund_job_exec`；`@ConditionalOnProperty(matchIfMissing=true)`
@@ -346,8 +379,9 @@
 ## PRE-001
 - rule_id: `PRE-001`
 - section: 退款预检与人工审核
-- title: 退款预检是只读操作
-- content: Refund Preview 只读取当前用户订单及其团队，计算退款类型、是否允许生成提议和是否需要人工审核；该服务不调用退款执行、消息、缓存写或仓储写方法。
+- title: 查看退款预览不会执行退款
+- content: 退款预览只用于判断当前订单是否可退、属于哪种退款情形以及是否需要人工审核，不会直接修改订单或执行退款。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#getRefundPreview/buildPreview`
   - 枚举 / 字段：`RefundPreviewVO`
@@ -356,8 +390,9 @@
 ## PRE-002
 - rule_id: `PRE-002`
 - section: 退款预检与人工审核
-- title: 已关闭订单不再生成退款提议
-- content: 订单状态为 `CLOSE` 时，预检返回 `refundType=null`、`refundProposalAllowed=false`、`requiresManualReview=false`。
+- title: 已关闭订单不能再次生成退款提议
+- content: 订单已经关闭时，不会再生成新的可确认退款提议。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#buildPreview`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CLOSE`
@@ -366,8 +401,9 @@
 ## PRE-003
 - rule_id: `PRE-003`
 - section: 退款预检与人工审核
-- title: UNPAID 预检组合
-- content: 订单为 `CREATE` 且团队为 `PROGRESS` 时，预检类型为 `UNPAID`，允许生成退款提议且不要求人工审核。
+- title: 未付款且未成团可以提议取消
+- content: 订单尚未付款且团队仍在拼团时，可以生成取消拼团的退款提议，通常不需要人工审核。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#buildPreview`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CREATE`、`GroupBuyOrderEnumVO.PROGRESS`
@@ -376,8 +412,9 @@
 ## PRE-004
 - rule_id: `PRE-004`
 - section: 退款预检与人工审核
-- title: PAID_UNFORMED 预检组合
-- content: 订单为 `COMPLETE` 且团队为 `PROGRESS` 时，预检类型为 `PAID_UNFORMED`，允许生成退款提议且不要求人工审核。
+- title: 已付款但未成团可以提议退款
+- content: 订单已经付款但团队仍未成团时，可以生成退款提议，通常不需要人工审核。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#buildPreview`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.COMPLETE`、`GroupBuyOrderEnumVO.PROGRESS`
@@ -386,8 +423,9 @@
 ## PRE-005
 - rule_id: `PRE-005`
 - section: 退款预检与人工审核
-- title: PAID_FORMED 必须人工审核
-- content: 订单为 `COMPLETE`，团队为 `COMPLETE` 或 `COMPLETE_FAIL` 时，预检类型为 `PAID_FORMED`；可以形成提议，但 `requiresManualReview=true`，Agent 退款协调器不会自动执行。
+- title: 已付款已成团退款需要人工审核
+- content: 订单已经付款且团队已经成团时，退款必须由人工审核，系统不会自动执行。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#buildPreview`；`AgentRefundService#refund`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.COMPLETE`、`GroupBuyOrderEnumVO.COMPLETE/COMPLETE_FAIL`、结果码 `MANUAL_REVIEW_REQUIRED`
@@ -396,8 +434,9 @@
 ## PRE-006
 - rule_id: `PRE-006`
 - section: 退款预检与人工审核
-- title: 未识别或终态组合禁止自动提议
-- content: 除明确的三种状态组合和已关闭订单外，其余组合返回 `refundType=null`、`refundProposalAllowed=false`、`requiresManualReview=true`。
+- title: 异常状态组合需要人工处理
+- content: 订单和团队状态不属于明确支持的退款情形时，系统不会生成可自动确认的退款提议，并会要求人工处理。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#buildPreview`
   - 枚举 / 字段：退款预检默认分支
@@ -406,8 +445,9 @@
 ## PRE-007
 - rule_id: `PRE-007`
 - section: 退款预检与人工审核
-- title: 退款预检版本由订单与团队共同组成
-- content: 预检分别返回订单和团队真实 `updateTime`；Agent 执行前把二者格式化并拼为 `orderUpdateTime|teamUpdateTime`，任一版本或预期退款类型变化都会返回 `VERSION_CHANGED`，不调用真实退款服务。
+- title: 订单或团队变化后需重新提议
+- content: 退款提议生成后，如果订单状态或团队状态发生变化，原提议将不能继续执行，需要重新发起并确认。
+- visibility: public
 - source:
   - 类 / 方法：`RefundPreviewService#response`；`AgentRefundService#versionOf/refund`
   - 枚举 / 字段：`RefundPreviewVO.orderUpdateTime/teamUpdateTime/refundType`
@@ -416,8 +456,9 @@
 ## RFD-001
 - rule_id: `RFD-001`
 - section: 退款执行与到账边界
-- title: 真实退款策略按订单与团队状态联合选择
-- content: 执行退款时，`CREATE + PROGRESS` 选择未支付未成团策略，`COMPLETE + PROGRESS` 选择已支付未成团策略，`COMPLETE + (COMPLETE 或 COMPLETE_FAIL)` 选择已支付已成团策略；其他组合不受支持。
+- title: 退款方式由付款和成团情况决定
+- content: 系统会根据订单是否付款以及团队是否成团，区分未付款取消、已付款未成团退款和已付款已成团退款。
+- visibility: public
 - source:
   - 类 / 方法：`RefundTypeEnumVO#getRefundStrategy`；`RefundOrderNodeFilter#apply`
   - 枚举 / 字段：`UNPAID_UNLOCK`、`PAID_UNFORMED`、`PAID_FORMED`
@@ -426,8 +467,9 @@
 ## RFD-002
 - rule_id: `RFD-002`
 - section: 退款执行与到账边界
-- title: CLOSE 订单在退款执行链中按重复退单处理
-- content: 退款数据加载后若订单已经为 `CLOSE`，重复退单过滤器返回 `REPEAT`，不再进入退款策略执行。
+- title: 已关闭订单不会重复退款
+- content: 订单已经关闭后，再次发起同一退单操作不会重复执行退款。
+- visibility: public
 - source:
   - 类 / 方法：`UniqueRefundNodeFilter#apply`
   - 枚举 / 字段：`TradeOrderStatusEnumVO.CLOSE`、`TradeRefundBehaviorEnum.REPEAT`
@@ -436,8 +478,9 @@
 ## RFD-003
 - rule_id: `RFD-003`
 - section: 退款执行与到账边界
-- title: UNPAID 退款的数据库状态变化
-- content: 未支付未成团退款把当前用户订单从 `CREATE` 更新为 `CLOSE`，团队 `lock_count` 减 1，并创建退款通知任务；团队更新只允许在 `PROGRESS` 状态执行。
+- title: 未付款取消会释放参团名额
+- content: 未付款时取消拼团后，订单会关闭，之前占用的参团名额会被释放。
+- visibility: public
 - source:
   - 类 / 方法：`Unpaid2RefundStrategy#refundOrder`；`TradeRepository#unpaid2Refund`
   - 枚举 / 字段：`RefundTypeEnumVO.UNPAID_UNLOCK`；团队增量 `lockCount=-1`
@@ -446,8 +489,9 @@
 ## RFD-004
 - rule_id: `RFD-004`
 - section: 退款执行与到账边界
-- title: PAID_UNFORMED 退款的数据库状态变化
-- content: 已支付未成团退款把当前用户订单从 `COMPLETE` 更新为 `CLOSE`，并在进行中团队上将 `lock_count` 和 `complete_count` 各减 1，同时创建退款通知任务。
+- title: 已付款未成团退款会调整团队人数
+- content: 已付款但尚未成团时退款，订单会关闭，团队中的占位人数和已付款人数会同步减少。
+- visibility: public
 - source:
   - 类 / 方法：`Paid2RefundStrategy#refundOrder`；`TradeRepository#paid2Refund`
   - 枚举 / 字段：`RefundTypeEnumVO.PAID_UNFORMED`；两个人数增量均为 -1
@@ -456,8 +500,9 @@
 ## RFD-005
 - rule_id: `RFD-005`
 - section: 退款执行与到账边界
-- title: 已支付已成团退款会改变成团结果状态
-- content: 已支付已成团退款把订单从 `COMPLETE` 更新为 `CLOSE`，并减少团队锁单数与完成数；退款前完成数大于 1 时团队变为 `COMPLETE_FAIL`，等于 1 时团队变为 `FAIL`。
+- title: 成团后退单会影响团队结果
+- content: 已经成团后发生退款，订单会关闭，团队结果会根据剩余已完成人数变为成团后有退单或拼团失败。
+- visibility: public
 - source:
   - 类 / 方法：`PaidTeam2RefundStrategy#refundOrder`；`TradeRepository#paidTeam2Refund`
   - 枚举 / 字段：`GroupBuyOrderEnumVO.COMPLETE_FAIL/FAIL`、`completeCount`
@@ -466,8 +511,9 @@
 ## RFD-006
 - rule_id: `RFD-006`
 - section: 退款执行与到账边界
-- title: 退款更新必须各命中一行
-- content: 三种退款仓储操作都要求订单更新和团队更新各命中恰好 1 行；否则抛出 `UPDATE_ZERO`。这些操作处于同一事务方法中，因此失败不会被当作成功退款结果。
+- title: 退款相关状态必须完整更新
+- content: 退款涉及的订单和团队状态必须全部更新成功；任一部分失败，本次操作都不能视为退款成功。
+- visibility: internal
 - source:
   - 类 / 方法：`TradeRepository#unpaid2Refund/paid2Refund/paidTeam2Refund`，均标注 `@Transactional`
   - 枚举 / 字段：`ResponseCode.UPDATE_ZERO`
@@ -476,8 +522,9 @@
 ## RFD-007
 - rule_id: `RFD-007`
 - section: 退款执行与到账边界
-- title: CLOSE 不能证明支付渠道退款到账
-- content: `CLOSE` 只证明 Java 拼团订单明细已进入“用户退单”状态。当前退款策略更新本地订单/团队并创建通知任务，但源码没有支付渠道退款流水号、渠道退款状态、到账金额或到账时间，因此不得把 `CLOSE` 解释为“资金已退回并到账”。
+- title: 订单关闭不代表退款资金到账
+- content: 订单显示已关闭，只能说明拼团订单已经退单，不能证明支付渠道的退款资金已经到账；到账情况需要由支付渠道核实。
+- visibility: public
 - source:
   - 类 / 方法：`TradeOrderStatusEnumVO`；`TradeRepository#unpaid2Refund/paid2Refund/paidTeam2Refund`
   - 枚举 / 字段：`CLOSE(2, "用户退单")`；本地通知字段不等同于渠道退款回执
