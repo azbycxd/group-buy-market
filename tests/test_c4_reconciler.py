@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -181,6 +182,20 @@ class RefundReconcilerTests(unittest.TestCase):
         self.assertEqual(final["needs_manual"], 1)
         self.assertEqual(sixth["scanned"], 0)
         self.assertEqual(query.call_count, 5)
+
+        from api import _action_status_response
+
+        response = _action_status_response(
+            final,
+            message="退款结果暂时无法确认，正在等待对账。",
+        )
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(payload["needs_manual"])
+        self.assertEqual(
+            payload["message"],
+            "退款结果暂时无法自动确认，已转人工处理。",
+        )
 
     def test_terminal_cas_does_not_overwrite_concurrent_change(self) -> None:
         action = self._unknown()

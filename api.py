@@ -195,6 +195,7 @@ def _action_status_response(
     message: str | None = None,
 ) -> JSONResponse:
     action_status = str(action["status"])
+    needs_manual = bool(int(action.get("needs_manual") or 0))
     if action_status == ActionStatus.SUCCEEDED.value:
         status_code = status.HTTP_200_OK
         default_message = (
@@ -218,6 +219,11 @@ def _action_status_response(
     else:
         status_code = status.HTTP_202_ACCEPTED
         default_message = "退款确认正在处理中。"
+    response_message = (
+        "退款结果暂时无法自动确认，已转人工处理。"
+        if needs_manual
+        else message or default_message
+    )
     return JSONResponse(
         status_code=status_code,
         content={
@@ -225,7 +231,8 @@ def _action_status_response(
             "status": action_status,
             "version": int(action["version"]),
             "executed": action_status == ActionStatus.SUCCEEDED.value,
-            "message": message or default_message,
+            "needs_manual": needs_manual,
+            "message": response_message,
         },
     )
 

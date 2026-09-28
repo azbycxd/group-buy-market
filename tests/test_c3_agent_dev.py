@@ -184,6 +184,20 @@ class _RefundRecordingProxy:
                 elif self.path == "/api/v1/agent/order/refund/result":
                     body = json.loads(raw_body)
                     owner.result_keys.append(str(body["idempotencyKey"]))
+                if (
+                    owner.refund_delay_mode == "service_unavailable"
+                    and self.path in {
+                        "/api/v1/agent/order/refund",
+                        "/api/v1/agent/order/refund/result",
+                    }
+                ):
+                    payload = b'{"code":"SERVICE_UNAVAILABLE"}'
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 forwarded_headers = {
                     name: value
                     for name, value in self.headers.items()
@@ -723,6 +737,64 @@ class C3AgentDevIntegrationTests(unittest.TestCase):
         finally:
             if proxy is not None:
                 proxy.close()
+            self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
+
+    def test_11_java_unavailable_then_result_reconcile_after_recovery(
+        self,
+    ) -> None:
+        proxy = _RefundRecordingProxy(
+            REAL_JAVA_BASE_URL,
+            refund_delay_mode="service_unavailable",
+        )
+        proxy.start()
+        try:
+            self._restart_api(
+                f"http://127.0.0.1:{proxy.port}",
+                refund_timeout=1.0,
+            )
+            event, action, _ = self._proposal(
+                "agent_c3_unpaid",
+                "930000000001",
+            )
+            response = self._confirm(event, "agent_c3_unpaid")
+            unknown = self.store.get_action(str(action["action_id"]))
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertEqual(unknown["status"], "UNKNOWN")
+            self.assertEqual(proxy.refund_keys, [action["idempotency_key"]])
+
+            environment = {
+                "AGENT_ACTION_DB_PATH": str(self.action_path),
+                "JAVA_BASE_URL": REAL_JAVA_BASE_URL,
+                "JAVA_REFUND_RESULT_TIMEOUT_SECONDS": "5",
+            }
+            with patch.dict(os.environ, environment):
+                summary = reconcile_stuck_actions(
+                    now=datetime.now(timezone.utc),
+                    min_age=0,
+                )
+
+            final = self.store.get_action(str(action["action_id"]))
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(final["status"], "FAILED")
+            self.assertEqual(
+                final["result_code"],
+                "NOT_RECEIVED_BEFORE_QUERY",
+            )
+            self.assertEqual(final["refund_executed"], 0)
+            self.assertEqual(len(proxy.refund_keys), 1)
+            self.assertEqual(
+                _mysql_scalar(
+                    "SELECT status FROM group_buy_order_list "
+                    "WHERE out_trade_no='930000000001'"
+                ),
+                "0",
+            )
+            self.assertEqual(
+                _mysql_scalar("SELECT COUNT(*) FROM notify_task"),
+                "0",
+            )
+        finally:
+            proxy.close()
             self._restart_api(REAL_JAVA_BASE_URL, refund_timeout=5.0)
 
 
