@@ -214,6 +214,32 @@ class DemoRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.status_code, 404)
         self.assertEqual(release.status_code, 404)
 
+    async def test_api_docs_are_hidden_only_in_demo_mode(self) -> None:
+        with patch.dict(os.environ, {"DEMO_ENABLED": "true"}, clear=False):
+            demo_app = create_app()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=demo_app),
+            base_url="http://test",
+        ) as client:
+            demo_statuses = [
+                (await client.get(path)).status_code
+                for path in ("/docs", "/redoc", "/openapi.json")
+            ]
+
+        with patch.dict(os.environ, {"DEMO_ENABLED": "false"}, clear=False):
+            development_app = create_app()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=development_app),
+            base_url="http://test",
+        ) as client:
+            development_statuses = [
+                (await client.get(path)).status_code
+                for path in ("/docs", "/redoc", "/openapi.json")
+            ]
+
+        self.assertEqual(demo_statuses, [404, 404, 404])
+        self.assertEqual(development_statuses, [200, 200, 200])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -217,11 +217,20 @@ docker compose --env-file deploy/.env.demo -f deploy/compose.yml up -d --build
 
 该 Compose 通过 `include` 引入 Java 的
 `group-buy-market-jiusi/deploy/demo/docker-compose.yml`，启动 Agent、Java、
-MySQL、Redis 和 RabbitMQ。只有 Agent 映射到宿主机
-`127.0.0.1:8000`；其他服务仅在 `demo-backend` 网络内可见。
+MySQL、Redis、RabbitMQ 和 Caddy。公网只发布 Caddy 的 `80/443`；Agent 的
+`8000` 只在 `demo-backend` 网络内暴露，由 Caddy 反向代理，Java 和基础设施服务
+继续不发布宿主机端口。`DEMO_DOMAIN` 必须解析到部署服务器，Caddy 会自动申请和
+续期 HTTPS 证书，并将 HTTP 重定向到 HTTPS。
 
 - `GET /healthz`：Agent 进程健康。
 - `GET /readyz`：RAG、Dense、CrossEncoder 已预热且 Java liveness 可达。
+
+Caddy 固定使用 `172.30.0.250`，所在网络默认为 `172.30.0.0/24`。Agent 设置
+`DEMO_TRUST_PROXY_HEADERS=true` 且只信任该固定地址；Caddy 会覆盖客户端提交的
+`X-Forwarded-*`，并用自身确认的连接来源生成 `X-Forwarded-For`。反向代理配置
+使用 `flush_interval -1`，确保 SSE 的 `progress`、`action_proposed`、`final`
+事件即时刷新。公网 HTTPS 响应包含 HSTS；Demo 模式同时关闭 `/docs`、`/redoc`
+和 `/openapi.json`，非 Demo 开发模式仍保留这些接口。
 
 FastAPI lifespan 会在 `yield` 前完成 RAG warmup，因此预热期间服务器尚未
 开始接收请求，`/healthz` 也暂时不可访问。这保持了“ready 后模型必定已加载”
@@ -240,8 +249,8 @@ Demo 固定使用单个 Uvicorn worker。当前 session lock 是进程内
 
 ### 极简面试页面
 
-Compose 默认设置 `DEMO_ENABLED=true`。服务 ready 后打开
-`http://127.0.0.1:8000/`，点击“开始体验”即可。页面调用
+Compose 默认设置 `DEMO_ENABLED=true`。服务 ready 且域名证书生效后打开
+`https://<DEMO_DOMAIN>/`，点击“开始体验”即可。页面调用
 `POST /demo/session` 获取 30 分钟有效的固定 `demo_user` 访问令牌与四个演示订单；
 浏览器不能提交或选择 `user_id`。JWT 和退款确认 credential 只保存在页面内存，
 不会写入 URL、Web Storage、控制台或普通聊天消息。页面只把非敏感
@@ -267,8 +276,8 @@ Demo 每日模型 token 上限默认 500,000，按 UTC 日期在 `/app/data/demo
 Java reset 和本地 Demo 数据清理不会清除 IP 计数或 token 配额。
 
 相关配置为 `DEMO_LEASE_TTL_SECONDS=1800`、`DEMO_IDLE_TIMEOUT_SECONDS=300`、
-`DEMO_DAILY_TOKEN_LIMIT=500000`、`DEMO_TRUST_PROXY_HEADERS=false` 和
-`DEMO_TRUSTED_PROXY_IPS=127.0.0.1,::1`。单条消息最多 500 字。
+`DEMO_DAILY_TOKEN_LIMIT=500000`、`DEMO_TRUST_PROXY_HEADERS=true` 和
+`DEMO_TRUSTED_PROXY_IPS=172.30.0.250`。单条消息最多 500 字。
 `DEMO_ENABLED` 未开启时，页面、`/demo/session` 与 `/demo/release` 均不注册并返回
 `404`。
 

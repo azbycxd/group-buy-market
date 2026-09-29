@@ -1,0 +1,13 @@
+{$DEMO_DOMAIN} {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	reverse_proxy agent:8000 {
+		# Replace, rather than append, any client-supplied forwarding headers.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+
+		# Flush SSE progress/action_proposed/final events immediately.
+		flush_interval -1
+	}
+}

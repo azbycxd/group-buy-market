@@ -4,6 +4,25 @@ include:
   - path: ../../group-buy-market-jiusi/deploy/demo/docker-compose.yml
 
 services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DEMO_DOMAIN: ${DEMO_DOMAIN:?set DEMO_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      agent:
+        condition: service_healthy
+    networks:
+      demo-backend:
+        ipv4_address: ${DEMO_CADDY_IP:-172.30.0.250}
+
   agent:
     image: group-buy-agent:demo
     build:
@@ -18,8 +37,8 @@ services:
       DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-1800}
       DEMO_IDLE_TIMEOUT_SECONDS: ${DEMO_IDLE_TIMEOUT_SECONDS:-300}
       DEMO_DAILY_TOKEN_LIMIT: ${DEMO_DAILY_TOKEN_LIMIT:-500000}
-      DEMO_TRUST_PROXY_HEADERS: ${DEMO_TRUST_PROXY_HEADERS:-false}
-      DEMO_TRUSTED_PROXY_IPS: ${DEMO_TRUSTED_PROXY_IPS:-127.0.0.1,::1}
+      DEMO_TRUST_PROXY_HEADERS: "true"
+      DEMO_TRUSTED_PROXY_IPS: ${DEMO_CADDY_IP:-172.30.0.250}
       JAVA_BASE_URL: http://java:8091
       JAVA_INTERNAL_JWT_SECRET: ${AGENT_INTERNAL_JWT_SECRET:?set AGENT_INTERNAL_JWT_SECRET}
       JAVA_INTERNAL_JWT_ISSUER: ${AGENT_INTERNAL_JWT_ISSUER:?set AGENT_INTERNAL_JWT_ISSUER}
@@ -32,8 +51,8 @@ services:
       TRANSFORMERS_OFFLINE: "1"
     volumes:
       - agent-data:/app/data
-    ports:
-      - "127.0.0.1:8000:8000"
+    expose:
+      - "8000"
     depends_on:
       java:
         condition: service_healthy
@@ -52,3 +71,12 @@ services:
 
 volumes:
   agent-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  demo-backend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DEMO_DOCKER_SUBNET:-172.30.0.0/24}

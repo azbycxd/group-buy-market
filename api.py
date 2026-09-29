@@ -711,7 +711,13 @@ def create_app(
         finally:
             await close_async_order_agent(app.state.agent)
 
-    app = FastAPI(title="Group Buy Agent API", lifespan=lifespan)
+    app = FastAPI(
+        title="Group Buy Agent API",
+        lifespan=lifespan,
+        docs_url=None if demo_enabled else "/docs",
+        redoc_url=None if demo_enabled else "/redoc",
+        openapi_url=None if demo_enabled else "/openapi.json",
+    )
 
     if demo_enabled:
         static_headers = {
