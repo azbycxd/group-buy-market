@@ -34,6 +34,7 @@
     busy = value;
     sendButton.disabled = value;
     messageInput.disabled = value;
+    releaseButton.disabled = value;
     document.querySelectorAll("[data-question]").forEach((button) => {
       button.disabled = value;
     });

@@ -872,75 +872,97 @@ def create_app(
     ) -> StreamingResponse:
         request_id = uuid.uuid4().hex
         demo_token_counter: DemoTokenCounter | None = None
+        demo_lifecycle_lock: asyncio.Lock | None = None
+        demo_lifecycle_acquired = False
         if demo_enabled and user_id == DEMO_USER_ID:
-            claims = getattr(request.state, "auth_claims", None)
-            if not app.state.demo_lease.accepts(claims):
-                raise _unauthorized()
-            lease_id = str(claims["demo_lease_id"])
-            client_ip = _request_client_ip(request)
-            if not await app.state.demo_rate_limiter.allow(
-                f"{lease_id}|{client_ip}"
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail={
-                        "code": "DEMO_RATE_LIMITED",
-                        "message": "请求过于频繁，请稍后再试。",
-                    },
-                )
-            usage = await asyncio.to_thread(app.state.demo_store.token_usage)
-            if (
-                not app.state.demo_usage_available
-                or usage.total_tokens >= app.state.demo_daily_token_limit
-            ):
-                async def quota_exhausted() -> AsyncIterator[bytes]:
-                    yield _sse(
-                        "final",
-                        {
-                            "kind": OutcomeKind.HANDOFF.value,
-                            "answer": DEMO_QUOTA_EXHAUSTED_MESSAGE,
-                            "request_id": request_id,
+            demo_lifecycle_lock = app.state.demo_lifecycle_lock
+            await demo_lifecycle_lock.acquire()
+            demo_lifecycle_acquired = True
+            try:
+                claims = getattr(request.state, "auth_claims", None)
+                if not app.state.demo_lease.accepts(claims):
+                    raise _unauthorized()
+                lease_id = str(claims["demo_lease_id"])
+                client_ip = _request_client_ip(request)
+                if not await app.state.demo_rate_limiter.allow(
+                    f"{lease_id}|{client_ip}"
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail={
+                            "code": "DEMO_RATE_LIMITED",
+                            "message": "请求过于频繁，请稍后再试。",
                         },
                     )
-
-                return StreamingResponse(
-                    quota_exhausted(),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                    },
+                usage = await asyncio.to_thread(
+                    app.state.demo_store.token_usage
                 )
-            if not await app.state.demo_lease.touch(lease_id=lease_id):
-                raise _unauthorized()
-            demo_token_counter = DemoTokenCounter(
-                recorder=lambda input_tokens, output_tokens, total_tokens: (
-                    app.state.demo_store.add_token_usage(
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        total_tokens=total_tokens,
+                if (
+                    not app.state.demo_usage_available
+                    or usage.total_tokens
+                    >= app.state.demo_daily_token_limit
+                ):
+                    async def quota_exhausted() -> AsyncIterator[bytes]:
+                        yield _sse(
+                            "final",
+                            {
+                                "kind": OutcomeKind.HANDOFF.value,
+                                "answer": DEMO_QUOTA_EXHAUSTED_MESSAGE,
+                                "request_id": request_id,
+                            },
+                        )
+
+                    demo_lifecycle_lock.release()
+                    demo_lifecycle_acquired = False
+                    return StreamingResponse(
+                        quota_exhausted(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                if not await app.state.demo_lease.touch(lease_id=lease_id):
+                    raise _unauthorized()
+                demo_token_counter = DemoTokenCounter(
+                    recorder=lambda input_tokens, output_tokens, total_tokens: (
+                        app.state.demo_store.add_token_usage(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                        )
                     )
                 )
+            except BaseException:
+                if demo_lifecycle_acquired:
+                    demo_lifecycle_lock.release()
+                    demo_lifecycle_acquired = False
+                raise
+        try:
+            if not await app.state.session_ownership.claim(
+                payload.session_id,
+                user_id,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="该 session_id 已属于其他用户",
+                )
+            session_lock = await app.state.session_locks.try_acquire(
+                payload.session_id
             )
-        if not await app.state.session_ownership.claim(
-            payload.session_id,
-            user_id,
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="该 session_id 已属于其他用户",
-            )
-        session_lock = await app.state.session_locks.try_acquire(
-            payload.session_id
-        )
-        if session_lock is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": "SESSION_BUSY",
-                    "message": "该会话正在处理另一个请求，请稍后重试。",
-                },
-            )
+            if session_lock is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "SESSION_BUSY",
+                        "message": "该会话正在处理另一个请求，请稍后重试。",
+                    },
+                )
+        except BaseException:
+            if demo_lifecycle_acquired and demo_lifecycle_lock is not None:
+                demo_lifecycle_lock.release()
+                demo_lifecycle_acquired = False
+            raise
 
         async def event_stream() -> AsyncIterator[bytes]:
             queue: asyncio.Queue[
@@ -1108,10 +1130,17 @@ def create_app(
                         request_id,
                         execution,
                     )
-                app.state.session_locks.release(
-                    payload.session_id,
-                    session_lock,
-                )
+                try:
+                    app.state.session_locks.release(
+                        payload.session_id,
+                        session_lock,
+                    )
+                finally:
+                    if (
+                        demo_lifecycle_acquired
+                        and demo_lifecycle_lock is not None
+                    ):
+                        demo_lifecycle_lock.release()
 
         return StreamingResponse(
             event_stream(),

@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -21,6 +22,8 @@ from demo import (
 )
 from demo_reset import DemoResetResult, DemoResetStatus
 from demo_store import DemoPersistentStore
+from outcome import AgentOutcome, Claim, ClaimType, OutcomeKind
+from session_locks import SessionLockRegistry
 
 
 SECRET = "demo-hardening-test-secret-at-least-32-chars"
@@ -100,6 +103,48 @@ async def _state_for_reset(
     return SimpleNamespace(state=state), grant
 
 
+def _successful_outcome() -> AgentOutcome:
+    return AgentOutcome(
+        kind=OutcomeKind.ANSWER,
+        claims=[
+            Claim(
+                text="测试回答",
+                type=ClaimType.CAPABILITY,
+                evidence=[],
+            )
+        ],
+        final_answer="测试回答",
+    )
+
+
+async def _configured_http_demo(
+    temporary: str,
+    *,
+    action_store: object | None = None,
+) -> tuple[object, dict[str, object]]:
+    with patch.dict("os.environ", {"DEMO_ENABLED": "true"}):
+        app = api.create_app()
+    app.state.jwt_secret = SECRET
+    app.state.demo_lease = DemoSessionLease()
+    grant = await app.state.demo_lease.issue(jwt_secret=SECRET)
+    app.state.demo_rate_limiter = DemoRateLimiter()
+    app.state.demo_store = DemoPersistentStore(
+        Path(temporary) / "demo.sqlite"
+    )
+    app.state.demo_daily_token_limit = 500_000
+    app.state.demo_usage_available = True
+    app.state.demo_trust_proxy_headers = False
+    app.state.demo_trusted_proxy_ips = {"127.0.0.1", "::1"}
+    app.state.demo_lifecycle_lock = asyncio.Lock()
+    app.state.session_ownership = FakeOwnership(["chat-1"])
+    app.state.session_locks = SessionLockRegistry()
+    app.state.action_store = action_store or FakeActionStore()
+    app.state.agent = object()
+    app.state.request_timeout_seconds = 2.0
+    app.state.execution_events = []
+    return app, grant
+
+
 class DemoHardeningTests(unittest.IsolatedAsyncioTestCase):
     async def test_01_payload_session_id_cannot_bypass_chat_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -116,6 +161,7 @@ class DemoHardeningTests(unittest.IsolatedAsyncioTestCase):
             app.state.demo_usage_available = True
             app.state.demo_trust_proxy_headers = False
             app.state.demo_trusted_proxy_ips = {"127.0.0.1", "::1"}
+            app.state.demo_lifecycle_lock = asyncio.Lock()
             key = (
                 f"{(await app.state.demo_lease.snapshot()).lease_id}|"
                 "127.0.0.1"
@@ -304,6 +350,7 @@ class DemoHardeningTests(unittest.IsolatedAsyncioTestCase):
             app.state.demo_usage_available = True
             app.state.demo_trust_proxy_headers = False
             app.state.demo_trusted_proxy_ips = {"127.0.0.1"}
+            app.state.demo_lifecycle_lock = asyncio.Lock()
             mocked = AsyncMock()
             with patch.object(api, "_run_agent", mocked):
                 transport = httpx.ASGITransport(
@@ -369,6 +416,188 @@ class DemoHardeningTests(unittest.IsolatedAsyncioTestCase):
             release = await client.post("/demo/release")
         self.assertEqual(session.status_code, 404)
         self.assertEqual(release.status_code, 404)
+
+
+class DemoLifecycleSerializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_blocks_release_until_execution_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app, grant = await _configured_http_demo(temporary)
+            started = asyncio.Event()
+            finish = asyncio.Event()
+
+            async def slow_agent(*args: object, **kwargs: object) -> AgentOutcome:
+                del args, kwargs
+                started.set()
+                await finish.wait()
+                return _successful_outcome()
+
+            reset_result = DemoResetResult(DemoResetStatus.SUCCESS, "0000")
+            with patch.object(api, "_run_agent", new=slow_agent), patch.object(
+                api, "reset_demo_java", return_value=reset_result
+            ) as reset:
+                transport = httpx.ASGITransport(
+                    app=app, client=("127.0.0.1", 1234)
+                )
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    headers = {
+                        "Authorization": f"Bearer {grant['token']}"
+                    }
+                    chat = asyncio.create_task(
+                        client.post(
+                            "/api/v1/chat/stream",
+                            headers=headers,
+                            json={
+                                "session_id": "chat-1",
+                                "message": "查询订单状态",
+                            },
+                        )
+                    )
+                    await asyncio.wait_for(started.wait(), timeout=1)
+                    self.assertTrue(app.state.demo_lifecycle_lock.locked())
+                    release = asyncio.create_task(
+                        client.post("/demo/release", headers=headers)
+                    )
+                    await asyncio.sleep(0.05)
+                    self.assertFalse(release.done())
+                    reset.assert_not_called()
+
+                    finish.set()
+                    chat_response = await asyncio.wait_for(chat, timeout=2)
+                    release_response = await asyncio.wait_for(
+                        release, timeout=2
+                    )
+
+            self.assertEqual(chat_response.status_code, 200)
+            self.assertEqual(release_response.status_code, 200)
+            reset.assert_called_once()
+            self.assertIsNone(await app.state.demo_lease.snapshot())
+            self.assertFalse(app.state.demo_lifecycle_lock.locked())
+
+    async def test_agent_exception_releases_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app, grant = await _configured_http_demo(temporary)
+
+            async def broken_agent(
+                *args: object, **kwargs: object
+            ) -> AgentOutcome:
+                del args, kwargs
+                raise RuntimeError("deterministic failure")
+
+            with patch.object(api, "_run_agent", new=broken_agent):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.post(
+                        "/api/v1/chat/stream",
+                        headers={
+                            "Authorization": f"Bearer {grant['token']}"
+                        },
+                        json={
+                            "session_id": "chat-exception",
+                            "message": "触发异常",
+                        },
+                    )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("HANDOFF", response.text)
+            self.assertFalse(app.state.demo_lifecycle_lock.locked())
+
+    async def test_client_cancellation_releases_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app, grant = await _configured_http_demo(temporary)
+            started = asyncio.Event()
+            never = asyncio.Event()
+
+            async def hanging_agent(
+                *args: object, **kwargs: object
+            ) -> AgentOutcome:
+                del args, kwargs
+                started.set()
+                await never.wait()
+                return _successful_outcome()
+
+            with patch.object(api, "_run_agent", new=hanging_agent):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    chat = asyncio.create_task(
+                        client.post(
+                            "/api/v1/chat/stream",
+                            headers={
+                                "Authorization": f"Bearer {grant['token']}"
+                            },
+                            json={
+                                "session_id": "chat-cancel",
+                                "message": "保持执行",
+                            },
+                        )
+                    )
+                    await asyncio.wait_for(started.wait(), timeout=1)
+                    self.assertTrue(app.state.demo_lifecycle_lock.locked())
+                    chat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await chat
+                    for _ in range(20):
+                        if not app.state.demo_lifecycle_lock.locked():
+                            break
+                        await asyncio.sleep(0.01)
+
+            self.assertFalse(app.state.demo_lifecycle_lock.locked())
+
+    async def test_proposed_action_is_cleared_after_chat_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            action_store = AgentActionStore(
+                Path(temporary) / "actions.sqlite"
+            )
+            app, grant = await _configured_http_demo(
+                temporary, action_store=action_store
+            )
+
+            async def proposal_agent(
+                *args: object, **kwargs: object
+            ) -> AgentOutcome:
+                del args, kwargs
+                action_store.create_or_reuse_refund_proposal(
+                    session_id="chat-proposal",
+                    user_id=DEMO_USER_ID,
+                    out_trade_no="930000000001",
+                    preview={"refundType": "UNPAID"},
+                    expected_version="order-version|team-version",
+                )
+                return _successful_outcome()
+
+            reset_result = DemoResetResult(DemoResetStatus.SUCCESS, "0000")
+            with patch.object(api, "_run_agent", new=proposal_agent), patch.object(
+                api, "reset_demo_java", return_value=reset_result
+            ):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    headers = {
+                        "Authorization": f"Bearer {grant['token']}"
+                    }
+                    chat_response = await client.post(
+                        "/api/v1/chat/stream",
+                        headers=headers,
+                        json={
+                            "session_id": "chat-proposal",
+                            "message": "生成退款提议",
+                        },
+                    )
+                    self.assertEqual(len(action_store.list_actions()), 1)
+                    release_response = await client.post(
+                        "/demo/release", headers=headers
+                    )
+
+            self.assertEqual(chat_response.status_code, 200)
+            self.assertEqual(release_response.status_code, 200)
+            self.assertEqual(action_store.list_actions(), [])
+            self.assertIsNone(await app.state.demo_lease.snapshot())
 
 
 class LedgerDemoResetTests(unittest.TestCase):

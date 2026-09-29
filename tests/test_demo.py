@@ -197,6 +197,7 @@ class DemoRouteTests(unittest.IsolatedAsyncioTestCase):
             "sessionStorage.setItem(leaseStorageKey, pendingAction",
             source,
         )
+        self.assertIn("releaseButton.disabled = value;", source)
 
     async def test_demo_routes_are_absent_when_disabled(self) -> None:
         with patch.dict(os.environ, {"DEMO_ENABLED": "false"}, clear=False):
