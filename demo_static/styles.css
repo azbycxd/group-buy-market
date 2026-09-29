@@ -64,6 +64,9 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.04em; }
 }
 
 .status.active { color: var(--success); border-color: #b8e1d0; background: #edfbf5; }
+.hero-actions { display: flex; align-items: center; gap: 10px; }
+.release { padding: 9px 13px; border: 1px solid #f1b7b2; border-radius: 999px; color: var(--danger); background: #fff6f5; font-weight: 700; }
+.release:hover { background: #fff0ee; }
 
 .start-panel {
   display: grid;
@@ -193,6 +196,7 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.04em; }
   .shell { width: min(100% - 20px, 1120px); padding-top: 24px; }
   .hero { display: block; }
   .status { display: inline-block; margin-top: 16px; }
+  .hero-actions { justify-content: space-between; }
   .start-panel { grid-template-columns: 1fr; }
   .workspace { grid-template-columns: 1fr; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }

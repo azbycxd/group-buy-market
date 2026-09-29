@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from demo import (
     DemoSessionBusyError,
     DemoSessionLease,
 )
+from demo_store import DemoPersistentStore
 
 
 class MutableClock:
@@ -61,10 +63,15 @@ class DemoLeaseTests(unittest.IsolatedAsyncioTestCase):
             )
 
         clock.value += 1801
-        replacement = await lease.issue(
-            jwt_secret=secret,
-            lease_token=payload["lease_token"],
-        )
+        with self.assertRaises(DemoSessionBusyError):
+            await lease.issue(
+                jwt_secret=secret,
+                lease_token=payload["lease_token"],
+            )
+        snapshot = await lease.snapshot()
+        self.assertIsNotNone(snapshot)
+        await lease.clear(expected_lease_id=snapshot.lease_id)
+        replacement = await lease.issue(jwt_secret=secret)
         self.assertNotEqual(replacement["token"], payload["token"])
         self.assertNotEqual(
             replacement["lease_token"],
@@ -89,46 +96,53 @@ class DemoLeaseTests(unittest.IsolatedAsyncioTestCase):
 class DemoRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_demo_route_contract_and_429(self) -> None:
         secret = "route-test-secret-at-least-32-characters"
-        with patch.dict(os.environ, {"DEMO_ENABLED": "true"}, clear=False):
-            app = create_app()
-        app.state.jwt_secret = secret
-        app.state.demo_lease = DemoSessionLease()
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://test",
-        ) as client:
-            page = await client.get("/")
-            first = await client.post("/demo/session")
-            recovered = await client.post(
-                "/demo/session",
-                json={"lease_token": first.json()["lease_token"]},
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"DEMO_ENABLED": "true"}, clear=False):
+                app = create_app()
+            app.state.jwt_secret = secret
+            app.state.demo_lease = DemoSessionLease()
+            app.state.demo_store = DemoPersistentStore(
+                Path(temporary) / "demo.sqlite"
             )
-            second = await client.post("/demo/session")
-            wrong = await client.post(
-                "/demo/session",
-                json={
-                    "lease_token": (
-                        "wrong-lease-token-with-enough-characters"
-                    )
-                },
-            )
-            controlled_user = await client.post(
-                "/demo/session",
-                json={"user_id": "attacker-controlled-user"},
-            )
-            lease_as_bearer = await client.post(
-                "/api/v1/chat/stream",
-                headers={
-                    "Authorization": (
-                        f"Bearer {first.json()['lease_token']}"
-                    )
-                },
-                json={
-                    "session_id": "lease-token-is-not-jwt",
-                    "message": "查询订单状态",
-                },
-            )
+            app.state.demo_lifecycle_lock = asyncio.Lock()
+            app.state.demo_trust_proxy_headers = False
+            app.state.demo_trusted_proxy_ips = {"127.0.0.1", "::1"}
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                page = await client.get("/")
+                first = await client.post("/demo/session")
+                recovered = await client.post(
+                    "/demo/session",
+                    json={"lease_token": first.json()["lease_token"]},
+                )
+                second = await client.post("/demo/session")
+                wrong = await client.post(
+                    "/demo/session",
+                    json={
+                        "lease_token": (
+                            "wrong-lease-token-with-enough-characters"
+                        )
+                    },
+                )
+                controlled_user = await client.post(
+                    "/demo/session",
+                    json={"user_id": "attacker-controlled-user"},
+                )
+                lease_as_bearer = await client.post(
+                    "/api/v1/chat/stream",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {first.json()['lease_token']}"
+                        )
+                    },
+                    json={
+                        "session_id": "lease-token-is-not-jwt",
+                        "message": "查询订单状态",
+                    },
+                )
 
         self.assertEqual(page.status_code, 200)
         self.assertNotIn("token", page.text.lower())
@@ -194,8 +208,10 @@ class DemoRouteTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             page = await client.get("/")
             session = await client.post("/demo/session")
+            release = await client.post("/demo/release")
         self.assertEqual(page.status_code, 404)
         self.assertEqual(session.status_code, 404)
+        self.assertEqual(release.status_code, 404)
 
 
 if __name__ == "__main__":

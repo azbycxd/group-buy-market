@@ -406,6 +406,65 @@ class AgentActionStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def demo_reset_blockers(self, *, user_id: str) -> list[dict[str, Any]]:
+        """Return actions that make Demo reset unsafe."""
+        with closing(self._connect()) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_action
+                WHERE user_id = ?
+                  AND status IN ('CONFIRMED', 'EXECUTING', 'UNKNOWN')
+                ORDER BY updated_at, action_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_demo_actions(self, *, user_id: str) -> dict[str, Any]:
+        """Delete only safe, fixed-user Demo actions after Java reset."""
+        with closing(self._connect()) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                blockers = connection.execute(
+                    """
+                    SELECT action_id FROM agent_action
+                    WHERE user_id = ?
+                      AND status IN ('CONFIRMED', 'EXECUTING', 'UNKNOWN')
+                    """,
+                    (user_id,),
+                ).fetchall()
+                if blockers:
+                    connection.rollback()
+                    return {
+                        "cleared": False,
+                        "action_ids": [],
+                        "session_ids": [],
+                    }
+                rows = connection.execute(
+                    """
+                    SELECT action_id, session_id FROM agent_action
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchall()
+                connection.execute(
+                    "DELETE FROM agent_action WHERE user_id = ?",
+                    (user_id,),
+                )
+                connection.commit()
+                return {
+                    "cleared": True,
+                    "action_ids": [str(row["action_id"]) for row in rows],
+                    "session_ids": sorted(
+                        {str(row["session_id"]) for row in rows}
+                    ),
+                }
+            except Exception:
+                connection.rollback()
+                raise
+
     def list_stuck_actions(
         self,
         *,

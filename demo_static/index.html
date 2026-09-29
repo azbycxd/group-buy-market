@@ -15,7 +15,10 @@
         <h1>拼团智能客服</h1>
         <p class="subtitle">查订单、问规则，或体验安全的退款提议与确认流程。</p>
       </div>
-      <div class="status" id="session-status" aria-live="polite">尚未开始</div>
+      <div class="hero-actions">
+        <div class="status" id="session-status" aria-live="polite">尚未开始</div>
+        <button class="release hidden" id="release-button" type="button">结束体验</button>
+      </div>
     </header>
 
     <section class="start-panel" id="start-panel">
@@ -69,7 +72,7 @@
           >
           <button class="send" id="send-button" type="submit">发送</button>
         </form>
-        <p class="limit">单条消息最多 500 字；每分钟最多 20 条。</p>
+        <p class="limit">单条消息最多 500 字；每分钟最多 20 条。长时间无操作会自动释放演示环境。</p>
       </section>
     </section>
   </main>

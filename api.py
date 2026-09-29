@@ -41,11 +41,19 @@ from confirmation_workflow import (
     create_async_confirmation_workflow,
 )
 from demo import (
+    DEMO_DAILY_TOKEN_LIMIT,
+    DEMO_IDLE_TIMEOUT_SECONDS,
+    DEMO_QUOTA_EXHAUSTED_MESSAGE,
+    DEMO_SESSION_TTL_SECONDS,
     DEMO_USER_ID,
     DemoRateLimiter,
     DemoSessionBusyError,
     DemoSessionLease,
+    DemoTokenCounter,
+    trusted_client_ip,
 )
+from demo_reset import DemoResetStatus, reset_demo_java
+from demo_store import DemoPersistentStore
 from outcome import AgentOutcome, OutcomeKind
 from reconciler import reconcile_stuck_actions
 from rag.pipeline import warmup_rule_search_pipeline
@@ -101,6 +109,14 @@ def _positive_float(value: str | None, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
+def _positive_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _required_jwt_secret() -> str:
     secret = os.getenv("JWT_SECRET")
     if not secret:
@@ -110,6 +126,16 @@ def _required_jwt_secret() -> str:
 
 def _enabled(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _request_client_ip(request: Request) -> str:
+    direct_ip = request.client.host if request.client is not None else None
+    return trusted_client_ip(
+        direct_ip=direct_ip,
+        forwarded_for=request.headers.get("x-forwarded-for"),
+        trust_proxy_headers=request.app.state.demo_trust_proxy_headers,
+        trusted_proxy_ips=request.app.state.demo_trusted_proxy_ips,
+    )
 
 
 def _unauthorized() -> HTTPException:
@@ -284,6 +310,30 @@ async def authenticated_user_id(
     return user_id
 
 
+async def confirmation_user_id(
+    request: Request,
+    user_id: Annotated[str, Depends(authenticated_user_id)],
+) -> AsyncIterator[str]:
+    acquired = False
+    demo_lease = getattr(request.app.state, "demo_lease", None)
+    if demo_lease is not None and user_id == DEMO_USER_ID:
+        if not demo_lease.accepts(getattr(request.state, "auth_claims", None)):
+            raise _unauthorized()
+        await request.app.state.demo_lifecycle_lock.acquire()
+        acquired = True
+        if not demo_lease.accepts(
+            getattr(request.state, "auth_claims", None)
+        ):
+            request.app.state.demo_lifecycle_lock.release()
+            acquired = False
+            raise _unauthorized()
+    try:
+        yield user_id
+    finally:
+        if acquired:
+            request.app.state.demo_lifecycle_lock.release()
+
+
 def _sse(event: str, data: dict[str, Any]) -> bytes:
     payload = json.dumps(
         data,
@@ -384,11 +434,15 @@ async def _run_agent(
     action_store: AgentActionStore,
     user_id: str,
     request_id: str,
+    token_counter: DemoTokenCounter | None = None,
 ) -> AgentOutcome:
     loop = asyncio.get_running_loop()
     callback = ToolProgressCallback(loop, queue)
+    callbacks: list[BaseCallbackHandler] = [callback]
+    if token_counter is not None:
+        callbacks.append(token_counter)
     config = {
-        "callbacks": [callback],
+        "callbacks": callbacks,
         "configurable": {"thread_id": payload.session_id},
         "metadata": {
             "request_id": request_id,
@@ -494,6 +548,84 @@ async def _warmup_rag(app: FastAPI) -> None:
     logger.info("rag_warmup_completed latency_ms=%.2f", latency_ms)
 
 
+async def _reset_demo_lease(
+    app: FastAPI,
+    *,
+    lease_id: str,
+    request_id: str,
+) -> None:
+    blockers = await asyncio.to_thread(
+        app.state.action_store.demo_reset_blockers,
+        user_id=DEMO_USER_ID,
+    )
+    if blockers:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DEMO_RESET_IN_PROGRESS",
+                "message": "演示环境正在完成上一笔操作，请稍后再试。",
+            },
+        )
+
+    reset_result = await asyncio.to_thread(
+        reset_demo_java,
+        request_id=request_id,
+    )
+    if reset_result.status == DemoResetStatus.BLOCKED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": reset_result.code,
+                "message": "演示环境正在完成上一笔操作，请稍后再试。",
+            },
+        )
+    if reset_result.status != DemoResetStatus.SUCCESS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": reset_result.code,
+                "message": "演示环境暂时无法恢复，请稍后再试。",
+            },
+        )
+
+    actions = [
+        action
+        for action in await asyncio.to_thread(
+            app.state.action_store.list_actions
+        )
+        if action.get("user_id") == DEMO_USER_ID
+    ]
+    owned_sessions = await app.state.session_ownership.session_ids_for_user(
+        DEMO_USER_ID
+    )
+    action_sessions = [str(action["session_id"]) for action in actions]
+    action_threads = [f"action:{action['action_id']}" for action in actions]
+    await app.state.session_ownership.clear_demo_state(
+        user_id=DEMO_USER_ID,
+        thread_ids=owned_sessions + action_sessions + action_threads,
+    )
+    cleared = await asyncio.to_thread(
+        app.state.action_store.clear_demo_actions,
+        user_id=DEMO_USER_ID,
+    )
+    if not cleared["cleared"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DEMO_RESET_IN_PROGRESS",
+                "message": "演示环境正在完成上一笔操作，请稍后再试。",
+            },
+        )
+    if not await app.state.demo_lease.clear(expected_lease_id=lease_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DEMO_LEASE_CHANGED",
+                "message": "演示会话状态已变化，请重试。",
+            },
+        )
+
+
 def create_app(
     *,
     checkpoint_path: str | Path | None = None,
@@ -521,8 +653,34 @@ def create_app(
         app.state.confirmation_locks = SessionLockRegistry()
         app.state.action_store = AgentActionStore()
         if demo_enabled:
-            app.state.demo_lease = DemoSessionLease()
+            app.state.demo_lease = DemoSessionLease(
+                ttl_seconds=_positive_int(
+                    os.getenv("DEMO_LEASE_TTL_SECONDS"),
+                    DEMO_SESSION_TTL_SECONDS,
+                ),
+                idle_timeout_seconds=_positive_int(
+                    os.getenv("DEMO_IDLE_TIMEOUT_SECONDS"),
+                    DEMO_IDLE_TIMEOUT_SECONDS,
+                ),
+            )
             app.state.demo_rate_limiter = DemoRateLimiter()
+            app.state.demo_store = DemoPersistentStore()
+            app.state.demo_lifecycle_lock = asyncio.Lock()
+            app.state.demo_trust_proxy_headers = _enabled(
+                os.getenv("DEMO_TRUST_PROXY_HEADERS")
+            )
+            app.state.demo_trusted_proxy_ips = {
+                item.strip()
+                for item in os.getenv(
+                    "DEMO_TRUSTED_PROXY_IPS", "127.0.0.1,::1"
+                ).split(",")
+                if item.strip()
+            }
+            app.state.demo_daily_token_limit = _positive_int(
+                os.getenv("DEMO_DAILY_TOKEN_LIMIT"),
+                DEMO_DAILY_TOKEN_LIMIT,
+            )
+            app.state.demo_usage_available = True
         await _warmup_rag(app)
         app.state.agent = await create_async_order_agent(selected_checkpoint)
         try:
@@ -595,22 +753,71 @@ def create_app(
             request: Request,
             session_request: DemoSessionRequest | None = None,
         ) -> JSONResponse:
-            try:
-                session_payload = await request.app.state.demo_lease.issue(
-                    jwt_secret=request.app.state.jwt_secret,
-                    lease_token=(
-                        session_request.lease_token
-                        if session_request is not None
-                        else None
-                    ),
-                )
-            except DemoSessionBusyError as error:
+            client_ip = _request_client_ip(request)
+            allowed = await asyncio.to_thread(
+                request.app.state.demo_store.allow_session_request,
+                client_ip,
+            )
+            if not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="演示环境正在使用，请稍后再试。",
-                ) from error
+                    detail={
+                        "code": "DEMO_SESSION_RATE_LIMITED",
+                        "message": "开始体验请求过于频繁，请稍后再试。",
+                    },
+                )
+            lease_token = (
+                session_request.lease_token
+                if session_request is not None
+                else None
+            )
+            async with request.app.state.demo_lifecycle_lock:
+                snapshot = await request.app.state.demo_lease.snapshot()
+                if snapshot is not None and not await (
+                    request.app.state.demo_lease.is_current()
+                ):
+                    await _reset_demo_lease(
+                        request.app,
+                        lease_id=snapshot.lease_id,
+                        request_id=uuid.uuid4().hex,
+                    )
+                try:
+                    session_payload = await request.app.state.demo_lease.issue(
+                        jwt_secret=request.app.state.jwt_secret,
+                        lease_token=lease_token,
+                    )
+                except DemoSessionBusyError as error:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="演示环境正在使用，请稍后再试。",
+                    ) from error
             return JSONResponse(
                 content=session_payload,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.post("/demo/release")
+        async def release_demo_session(
+            request: Request,
+            user_id: Annotated[str, Depends(authenticated_user_id)],
+        ) -> JSONResponse:
+            if user_id != DEMO_USER_ID or not request.app.state.demo_lease.accepts(
+                getattr(request.state, "auth_claims", None)
+            ):
+                raise _unauthorized()
+            lease_id = str(request.state.auth_claims["demo_lease_id"])
+            async with request.app.state.demo_lifecycle_lock:
+                if not request.app.state.demo_lease.accepts(
+                    getattr(request.state, "auth_claims", None)
+                ):
+                    raise _unauthorized()
+                await _reset_demo_lease(
+                    request.app,
+                    lease_id=lease_id,
+                    request_id=uuid.uuid4().hex,
+                )
+            return JSONResponse(
+                content={"released": True},
                 headers={"Cache-Control": "no-store"},
             )
 
@@ -663,13 +870,16 @@ def create_app(
         request: Request,
         user_id: Annotated[str, Depends(authenticated_user_id)],
     ) -> StreamingResponse:
+        request_id = uuid.uuid4().hex
+        demo_token_counter: DemoTokenCounter | None = None
         if demo_enabled and user_id == DEMO_USER_ID:
-            if not app.state.demo_lease.accepts(
-                getattr(request.state, "auth_claims", None)
-            ):
+            claims = getattr(request.state, "auth_claims", None)
+            if not app.state.demo_lease.accepts(claims):
                 raise _unauthorized()
+            lease_id = str(claims["demo_lease_id"])
+            client_ip = _request_client_ip(request)
             if not await app.state.demo_rate_limiter.allow(
-                payload.session_id
+                f"{lease_id}|{client_ip}"
             ):
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -678,7 +888,40 @@ def create_app(
                         "message": "请求过于频繁，请稍后再试。",
                     },
                 )
-        request_id = uuid.uuid4().hex
+            usage = await asyncio.to_thread(app.state.demo_store.token_usage)
+            if (
+                not app.state.demo_usage_available
+                or usage.total_tokens >= app.state.demo_daily_token_limit
+            ):
+                async def quota_exhausted() -> AsyncIterator[bytes]:
+                    yield _sse(
+                        "final",
+                        {
+                            "kind": OutcomeKind.HANDOFF.value,
+                            "answer": DEMO_QUOTA_EXHAUSTED_MESSAGE,
+                            "request_id": request_id,
+                        },
+                    )
+
+                return StreamingResponse(
+                    quota_exhausted(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            if not await app.state.demo_lease.touch(lease_id=lease_id):
+                raise _unauthorized()
+            demo_token_counter = DemoTokenCounter(
+                recorder=lambda input_tokens, output_tokens, total_tokens: (
+                    app.state.demo_store.add_token_usage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        total_tokens=total_tokens,
+                    )
+                )
+            )
         if not await app.state.session_ownership.claim(
             payload.session_id,
             user_id,
@@ -722,6 +965,7 @@ def create_app(
                         app.state.action_store,
                         user_id,
                         request_id,
+                        demo_token_counter,
                     )
                 )
                 yield _sse(
@@ -783,6 +1027,16 @@ def create_app(
 
                     if execution.done():
                         outcome = execution.result()
+                        final_kind = outcome.kind.value
+                        final_answer = outcome.final_answer
+                        if demo_token_counter is not None and (
+                            demo_token_counter.usage().total_tokens is None
+                        ):
+                            app.state.demo_usage_available = False
+                            final_kind = OutcomeKind.HANDOFF.value
+                            final_answer = (
+                                "演示额度统计暂时不可用，请稍后再试。"
+                            )
                         while not queue.empty():
                             event_name, event_data = queue.get_nowait()
                             yield _sse(event_name, event_data)
@@ -795,8 +1049,8 @@ def create_app(
                         yield _sse(
                             "final",
                             {
-                                "kind": outcome.kind.value,
-                                "answer": outcome.final_answer,
+                                "kind": final_kind,
+                                "answer": final_answer,
                                 "request_id": request_id,
                             },
                         )
@@ -872,7 +1126,8 @@ def create_app(
     async def confirm_action(
         action_id: str,
         payload: ActionConfirmRequest,
-        user_id: Annotated[str, Depends(authenticated_user_id)],
+        request: Request,
+        user_id: Annotated[str, Depends(confirmation_user_id)],
     ) -> JSONResponse:
         action = _validated_confirmation_identity(
             app.state.action_store,
@@ -880,6 +1135,14 @@ def create_app(
             user_id=user_id,
             credential=payload.credential,
         )
+        if demo_enabled and user_id == DEMO_USER_ID:
+            await app.state.demo_lease.touch(
+                lease_id=str(
+                    getattr(request.state, "auth_claims", {})[
+                        "demo_lease_id"
+                    ]
+                )
+            )
         if action.get("status") != ActionStatus.PROPOSED.value:
             return _action_status_response(action)
         _validated_confirmation_action(

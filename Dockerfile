@@ -39,6 +39,7 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     CHECKPOINT_DB_PATH=/app/data/checkpoints.sqlite \
     AGENT_ACTION_DB_PATH=/app/data/agent_actions.sqlite \
+    DEMO_STATE_DB_PATH=/app/data/demo_state.sqlite \
     RAG_DENSE_CACHE_DIR=/app/data/rag_cache
 
 VOLUME ["/app/data"]

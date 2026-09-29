@@ -21,6 +21,7 @@
   const composer = document.querySelector("#composer");
   const messageInput = document.querySelector("#message-input");
   const sendButton = document.querySelector("#send-button");
+  const releaseButton = document.querySelector("#release-button");
 
   const orderLabels = {
     unpaid: "未付款",
@@ -97,6 +98,10 @@
     setBusy(true);
     sessionStatus.textContent = "体验已结束";
     sessionStatus.classList.remove("active");
+    releaseButton.classList.add("hidden");
+    workspace.classList.add("hidden");
+    startPanel.classList.remove("hidden");
+    startButton.disabled = false;
   }
 
   async function startDemo() {
@@ -133,6 +138,7 @@
       workspace.classList.remove("hidden");
       sessionStatus.textContent = "体验中 · 30 分钟";
       sessionStatus.classList.add("active");
+      releaseButton.classList.remove("hidden");
       startNotice.textContent = "";
       setBusy(false);
       messageInput.focus();
@@ -222,7 +228,9 @@
       const detail = typeof payload.detail === "string"
         ? payload.detail
         : payload.detail?.message;
-      throw new Error(detail || `请求失败（${response.status}）`);
+      const error = new Error(detail || `请求失败（${response.status}）`);
+      error.status = response.status;
+      throw error;
     }
 
     const reader = response.body.getReader();
@@ -249,7 +257,8 @@
     if (busy || !token || !message.trim()) return;
     if (Date.now() >= expiresAt) {
       clearSession();
-      addMessage("assistant", "本次体验已过期，请刷新页面后重新开始。", "HANDOFF");
+      startNotice.textContent = "本次体验已到期，正在安全恢复演示数据……";
+      await startDemo();
       return;
     }
     setBusy(true);
@@ -259,6 +268,12 @@
       await streamChat(message.trim());
     } catch (error) {
       hideProgress();
+      if (error instanceof Error && error.status === 401) {
+        clearSession();
+        startNotice.textContent = "会话已空闲过期，正在安全恢复演示数据……";
+        await startDemo();
+        return;
+      }
       addMessage(
         "assistant",
         error instanceof Error ? error.message : "请求失败，请稍后再试。",
@@ -302,7 +317,41 @@
     }
   }
 
+  async function releaseDemo() {
+    if (!token || busy) return;
+    setBusy(true);
+    releaseButton.disabled = true;
+    try {
+      const response = await fetch("/demo/release", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload.detail === "string"
+          ? payload.detail
+          : payload.detail?.message;
+        throw new Error(detail || "暂时无法结束体验，请稍后再试。");
+      }
+      sessionStorage.removeItem(leaseStorageKey);
+      clearSession();
+      messages.replaceChildren();
+      startNotice.textContent = "体验已结束，演示数据已恢复。";
+    } catch (error) {
+      addMessage(
+        "assistant",
+        error instanceof Error ? error.message : "暂时无法结束体验，请稍后再试。",
+        "HANDOFF"
+      );
+      setBusy(false);
+    } finally {
+      releaseButton.disabled = false;
+    }
+  }
+
   startButton.addEventListener("click", startDemo);
+  releaseButton.addEventListener("click", releaseDemo);
   composer.addEventListener("submit", (event) => {
     event.preventDefault();
     const message = messageInput.value;
