@@ -10,8 +10,9 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = Path(__file__).with_name("cases.yaml")
 VALID_ACTIONS = {"ANSWER", "REQUEST_INPUT", "HANDOFF"}
 RUNS_PER_CASE = int(os.getenv("EVAL_RUNS_PER_CASE", "3"))
+FINAL_RESULTS_PATH = PROJECT_ROOT / "evals" / "results" / "final_69x3.json"
+FINAL_REPORT_PATH = PROJECT_ROOT / "docs" / "final_eval.md"
+FAILURE_STAGES = {
+    "UNDERSTANDING",
+    "ENTITY_RESOLUTION",
+    "REQUIREMENT_TRACKER",
+    "TOOL_SELECTION",
+    "TOOL_EXECUTION",
+    "RAG_RETRIEVAL",
+    "CLAIM_VALIDATION",
+    "OUTCOME_COMPOSITION",
+    "EVAL_ORACLE",
+    "OTHER",
+}
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
 
 
 @dataclass
@@ -41,9 +63,15 @@ class EvalRun:
     rule_matches: list[dict[str, Any]]
     rule_claims: list[dict[str, Any]]
     final_answer: str
+    input_tokens: int | None
+    output_tokens: int | None
     token_count: int
     latency_seconds: float
     reasons: list[str]
+    failure_stage: str | None
+    parsed_entities: list[dict[str, Any]]
+    requirement_status: str | None
+    tool_results: list[dict[str, Any]]
 
 
 @dataclass
@@ -55,30 +83,63 @@ class CaseRuns:
 class TokenCounter(BaseCallbackHandler):
     def __init__(self) -> None:
         self.total_tokens = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self._saw_usage = False
+        self._breakdown_complete = True
         self._lock = threading.Lock()
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
-        message_total = 0
+        handled = False
         for generation_list in response.generations:
             for generation in generation_list:
                 message = getattr(generation, "message", None)
                 usage = getattr(message, "usage_metadata", None)
                 if isinstance(usage, dict):
-                    total = usage.get("total_tokens")
-                    if isinstance(total, int):
-                        message_total += total
+                    handled = self._record_usage(usage) or handled
 
-        if message_total == 0 and isinstance(response.llm_output, dict):
+        if not handled and isinstance(response.llm_output, dict):
             usage = response.llm_output.get("token_usage") or response.llm_output.get(
                 "usage"
             )
             if isinstance(usage, dict):
-                total = usage.get("total_tokens")
-                if isinstance(total, int):
-                    message_total = total
+                self._record_usage(usage)
+
+    def _record_usage(self, usage: dict[str, Any]) -> bool:
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+        output_tokens = usage.get(
+            "output_tokens", usage.get("completion_tokens")
+        )
+        total_tokens = usage.get("total_tokens")
+        if not isinstance(total_tokens, int) and isinstance(
+            input_tokens, int
+        ) and isinstance(output_tokens, int):
+            total_tokens = input_tokens + output_tokens
+        if not isinstance(total_tokens, int):
+            return False
 
         with self._lock:
-            self.total_tokens += message_total
+            self._saw_usage = True
+            self.total_tokens += total_tokens
+            if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+                self.input_tokens += input_tokens
+                self.output_tokens += output_tokens
+            else:
+                self._breakdown_complete = False
+        return True
+
+    def usage(self) -> TokenUsage:
+        if not self._saw_usage:
+            return TokenUsage(None, None, None)
+        return TokenUsage(
+            input_tokens=(
+                self.input_tokens if self._breakdown_complete else None
+            ),
+            output_tokens=(
+                self.output_tokens if self._breakdown_complete else None
+            ),
+            total_tokens=self.total_tokens,
+        )
 
 
 def load_cases() -> list[dict[str, Any]]:
@@ -190,7 +251,7 @@ def invoke_case(
     context_type: Any,
     case: dict[str, Any],
     session_id: str | None = None,
-) -> tuple[dict[str, Any], int, float]:
+) -> tuple[dict[str, Any], TokenUsage, float]:
     counter = TokenCounter()
     context = context_type(user_id=case.get("user_id", "demo-user"))
     turns = case.get("turns") or [case["input"]]
@@ -220,13 +281,111 @@ def invoke_case(
         else:
             os.environ["FAKE_JAVA_BASE_URL"] = original_base_url
 
-    return result, counter.total_tokens, time.perf_counter() - started_at
+    return result, counter.usage(), time.perf_counter() - started_at
+
+
+_TOOL_EXPECTED_NEEDS: dict[str, set[str]] = {
+    "get_order_facts": {"ORDER_STATUS"},
+    "get_activity_facts": {"ACTIVITY_VALIDITY"},
+    "get_user_eligibility_facts": {"USER_ELIGIBILITY"},
+    "get_joinable_team_facts": {"JOINABLE_TEAMS"},
+    "search_group_buy_rules": {"RULE_EXPLANATION", "REFUND_POLICY"},
+}
+
+
+def _failure_stage(
+    *,
+    case: dict[str, Any],
+    reasons: list[str],
+    actual_action: str,
+    tools: list[str],
+    tool_results: list[dict[str, Any]],
+    evidence_paths: list[str],
+    understanding: list[str],
+    parsed_entities: list[dict[str, Any]],
+    requirement_status: str | None,
+    rule_matches: list[dict[str, Any]],
+) -> str | None:
+    """Attribute a failed run from structured state and tool records."""
+    if not reasons:
+        return None
+    reason_text = "\n".join(reasons)
+    if "Understanding 不符合允许路径" in reason_text:
+        return "UNDERSTANDING"
+    if "final_answer 与 validated claims 不一致" in reason_text:
+        return "OUTCOME_COMPOSITION"
+    if any(
+        marker in reason_text
+        for marker in (
+            "Claim 引用不存在 Evidence",
+            "Claim Evidence 类型错误",
+            "Claim 缺少 Evidence",
+            "RULE Claim",
+            "最终回答缺少真实标题引用",
+        )
+    ):
+        return "CLAIM_VALIDATION"
+    if actual_action == "ERROR":
+        return "OTHER"
+    if any(item.get("success") is False for item in tool_results):
+        return "TOOL_EXECUTION"
+
+    required_tools = set(case.get("required_tools", []))
+    missing_tools = required_tools.difference(tools)
+    if missing_tools:
+        if "search_group_buy_rules" in missing_tools and {
+            "ORDER_STATUS",
+            "ACTIVITY_VALIDITY",
+            "USER_ELIGIBILITY",
+            "JOINABLE_TEAMS",
+            "REFUND_REQUEST",
+        }.intersection(understanding):
+            # A generic rule question acquired a concrete-fact/action need and
+            # was consequently blocked on an entity the case never required.
+            return "UNDERSTANDING"
+        expected_needs = set().union(
+            *(_TOOL_EXPECTED_NEEDS.get(tool, set()) for tool in missing_tools)
+        )
+        if expected_needs and not expected_needs.intersection(understanding):
+            return "UNDERSTANDING"
+        if actual_action == "REQUEST_INPUT":
+            if requirement_status == "NEED_USER_INPUT" and not parsed_entities:
+                return "ENTITY_RESOLUTION"
+            return "REQUIREMENT_TRACKER"
+        return "TOOL_SELECTION"
+
+    rule_expected = (
+        "search_group_buy_rules" in required_tools
+        or bool(case.get("required_rule_ids"))
+        or bool(case.get("required_rule_ids_any"))
+    )
+    if rule_expected and "search_group_buy_rules" in tools and not rule_matches:
+        return "RAG_RETRIEVAL"
+    if "缺少 Evidence" in reason_text:
+        return "TOOL_EXECUTION" if tools else "TOOL_SELECTION"
+    if "调用禁用 Tool" in reason_text or "缺少精确 Tool 调用" in reason_text:
+        return "TOOL_SELECTION"
+    if "Rule matches 不符合预期" in reason_text:
+        return "EVAL_ORACLE"
+    if actual_action != case["expected_action"]:
+        if actual_action == "REQUEST_INPUT":
+            return (
+                "ENTITY_RESOLUTION"
+                if requirement_status == "NEED_USER_INPUT"
+                else "REQUIREMENT_TRACKER"
+            )
+        if actual_action == "HANDOFF" and evidence_paths:
+            return "CLAIM_VALIDATION"
+        if "OUT_OF_SCOPE" in understanding:
+            return "UNDERSTANDING"
+        return "REQUIREMENT_TRACKER"
+    return "OTHER"
 
 
 def evaluate_result(
     result: dict[str, Any],
     case: dict[str, Any],
-    token_count: int,
+    token_usage: TokenUsage,
     latency_seconds: float,
 ) -> EvalRun:
     tool_call_records = [
@@ -260,6 +419,22 @@ def evaluate_result(
         getattr(need, "value", str(need))
         for need in getattr(understanding, "needs", [])
     ]
+    parsed_entities = [
+        (
+            entity.as_dict()
+            if hasattr(entity, "as_dict")
+            else {
+                "entity_type": str(getattr(entity, "entity_type", "")),
+                "source_text": str(getattr(entity, "source_text", "")),
+                "value": getattr(entity, "value", None),
+            }
+        )
+        for entity in result.get("parsed_entities", [])
+    ]
+    requirement = result.get("requirement_status")
+    requirement_status = getattr(requirement, "value", requirement)
+    if requirement_status is not None:
+        requirement_status = str(requirement_status)
     oracle_path: dict[str, Any] | None = None
     oracle_paths = case.get("oracle_paths", [])
     if oracle_paths:
@@ -272,17 +447,32 @@ def evaluate_result(
             None,
         )
     rule_matches: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
     for message in result.get("messages", []):
-        if not isinstance(message, ToolMessage) or message.name != (
-            "search_group_buy_rules"
-        ):
+        if not isinstance(message, ToolMessage):
             continue
         content = message.content
         try:
             payload = json.loads(content) if isinstance(content, str) else content
         except json.JSONDecodeError:
+            tool_results.append(
+                {
+                    "tool": message.name,
+                    "success": None,
+                    "code": "INVALID_JSON",
+                }
+            )
             continue
         if not isinstance(payload, dict):
+            continue
+        tool_results.append(
+            {
+                "tool": message.name,
+                "success": payload.get("success"),
+                "code": payload.get("code"),
+            }
+        )
+        if message.name != "search_group_buy_rules":
             continue
         data = payload.get("data")
         matches = data.get("matches") if isinstance(data, dict) else None
@@ -476,6 +666,18 @@ def evaluate_result(
             f"{expected_agent_rounds}，实际 {result.get('agent_rounds')}"
         )
 
+    stage = _failure_stage(
+        case=case,
+        reasons=reasons,
+        actual_action=actual_action,
+        tools=tool_calls,
+        tool_results=tool_results,
+        evidence_paths=evidence_paths,
+        understanding=understanding_needs,
+        parsed_entities=parsed_entities,
+        requirement_status=requirement_status,
+        rule_matches=rule_matches,
+    )
     return EvalRun(
         passed=not reasons,
         actual_action=actual_action,
@@ -486,9 +688,15 @@ def evaluate_result(
         rule_matches=rule_matches,
         rule_claims=[claim.model_dump(mode="json") for claim in rule_claims],
         final_answer=outcome.final_answer if outcome is not None else "",
-        token_count=token_count,
+        input_tokens=token_usage.input_tokens,
+        output_tokens=token_usage.output_tokens,
+        token_count=token_usage.total_tokens or 0,
         latency_seconds=latency_seconds,
         reasons=reasons,
+        failure_stage=stage,
+        parsed_entities=parsed_entities,
+        requirement_status=requirement_status,
+        tool_results=tool_results,
     )
 
 
@@ -591,9 +799,354 @@ def print_metrics(results: list[CaseRuns]) -> None:
     print("CATEGORY_COUNTS " + json.dumps(Counter(item.case["category"] for item in results), ensure_ascii=False))
 
 
+def _git_text(*args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _evaluation_summary(results: list[CaseRuns]) -> dict[str, Any]:
+    runs = [run for item in results for run in item.runs]
+    passed_runs = sum(run.passed for run in runs)
+    run_interval = wilson_interval(passed_runs, len(runs))
+    pass_distribution = Counter(
+        sum(run.passed for run in item.runs) for item in results
+    )
+    stable_cases = pass_distribution[RUNS_PER_CASE]
+
+    category_rows: list[dict[str, Any]] = []
+    for category in dict.fromkeys(item.case["category"] for item in results):
+        category_cases = [
+            item for item in results if item.case["category"] == category
+        ]
+        category_runs = [run for item in category_cases for run in item.runs]
+        category_passes = sum(run.passed for run in category_runs)
+        category_rows.append(
+            {
+                "category": category,
+                "cases": len(category_cases),
+                "runs": len(category_runs),
+                "passed": category_passes,
+                "pass_rate": category_passes / len(category_runs),
+            }
+        )
+
+    stage_runs: Counter[str] = Counter()
+    stage_cases: dict[str, set[str]] = defaultdict(set)
+    for item in results:
+        for run in item.runs:
+            if run.passed:
+                continue
+            stage = run.failure_stage or "OTHER"
+            stage_runs[stage] += 1
+            stage_cases[stage].add(str(item.case["id"]))
+    failure_stage_rows = [
+        {
+            "failure_stage": stage,
+            "failed_runs": stage_runs[stage],
+            "affected_cases": len(stage_cases[stage]),
+        }
+        for stage in FAILURE_STAGES
+        if stage_runs[stage]
+    ]
+    failure_stage_rows.sort(
+        key=lambda row: (-row["failed_runs"], row["failure_stage"])
+    )
+
+    token_breakdown_available = all(
+        run.input_tokens is not None and run.output_tokens is not None
+        for run in runs
+    )
+    total_tokens_available = all(
+        run.input_tokens is not None
+        and run.output_tokens is not None
+        and run.token_count == run.input_tokens + run.output_tokens
+        for run in runs
+    )
+    token_usage: dict[str, Any]
+    if token_breakdown_available and total_tokens_available:
+        total_input = sum(run.input_tokens or 0 for run in runs)
+        total_output = sum(run.output_tokens or 0 for run in runs)
+        token_usage = {
+            "status": "available",
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+        }
+    else:
+        token_usage = {
+            "status": "unavailable",
+            "reason": "完整 input/output usage metadata 未覆盖全部运行",
+        }
+
+    affected = [
+        item for item in results if not all(run.passed for run in item.runs)
+    ]
+    return {
+        "passed_runs": passed_runs,
+        "total_runs": len(runs),
+        "single_run_pass_rate": passed_runs / len(runs),
+        "single_run_wilson_95": {
+            "lower": run_interval[0],
+            "upper": run_interval[1],
+        },
+        "stable_cases": stable_cases,
+        "total_cases": len(results),
+        "stable_case_rate": stable_cases / len(results),
+        "case_pass_distribution": {
+            f"{passed}/{RUNS_PER_CASE}": pass_distribution[passed]
+            for passed in range(RUNS_PER_CASE, -1, -1)
+        },
+        "stability": {
+            "cases_with_at_least_one_failure": len(affected),
+            "cases_failed_one_of_three": pass_distribution[2],
+            "cases_failed_at_least_two_of_three": (
+                pass_distribution[1] + pass_distribution[0]
+            ),
+            "cases_failed_three_of_three": pass_distribution[0],
+        },
+        "categories": category_rows,
+        "failure_stages": failure_stage_rows,
+        "token_usage": token_usage,
+    }
+
+
+def _machine_runs(results: list[CaseRuns]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in results:
+        for run_index, run in enumerate(item.runs, start=1):
+            records.append(
+                {
+                    "case_id": item.case["id"],
+                    "category": item.case["category"],
+                    "run": run_index,
+                    "passed": run.passed,
+                    "expected_outcome": item.case["expected_action"],
+                    "actual_outcome": run.actual_action,
+                    "failure_stage": run.failure_stage,
+                    "reasons": run.reasons,
+                    "understanding": run.understanding,
+                    "parsed_entities": run.parsed_entities,
+                    "requirement_status": run.requirement_status,
+                    "tools": run.tools,
+                    "tool_results": run.tool_results,
+                    "evidence_paths": run.evidence_paths,
+                    "rule_queries": run.rule_queries,
+                    "rule_matches": [
+                        {
+                            "rule_id": match.get("rule_id"),
+                            "rerank_score": match.get("rerank_score"),
+                        }
+                        for match in run.rule_matches
+                    ],
+                    "rule_claims": run.rule_claims,
+                    "latency_seconds": run.latency_seconds,
+                    "tokens": {
+                        "input": run.input_tokens,
+                        "output": run.output_tokens,
+                        "total": (
+                            run.token_count
+                            if run.input_tokens is not None
+                            and run.output_tokens is not None
+                            else None
+                        ),
+                    },
+                }
+            )
+    return records
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _write_final_artifacts(
+    results: list[CaseRuns],
+    metadata: dict[str, Any],
+) -> None:
+    summary = _evaluation_summary(results)
+    machine_payload = {
+        "metadata": metadata,
+        "summary": summary,
+        "runs": _machine_runs(results),
+    }
+    FINAL_RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FINAL_RESULTS_PATH.write_text(
+        json.dumps(machine_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    distribution = summary["case_pass_distribution"]
+    token_usage = summary["token_usage"]
+    lines = [
+        "# E1 Final Evaluation — 69 × 3",
+        "",
+        "## Run metadata",
+        "",
+        f"- Git commit: `{metadata['git_commit']}`",
+        f"- Branch: `{metadata['git_branch']}`",
+        f"- Model: `{metadata['model']}`",
+        f"- Started: `{metadata['started_at']}`",
+        f"- Completed: `{metadata['completed_at']}`",
+        f"- Total elapsed: `{metadata['elapsed_seconds']:.3f}s`",
+        f"- Parameters: `EVAL_RUNS_PER_CASE={RUNS_PER_CASE}`; sequential runs; independent thread IDs",
+        f"- Working tree dirty at start: `{str(metadata['working_tree_dirty']).lower()}` (evaluation/report instrumentation only)",
+        "",
+        "## Core metrics",
+        "",
+        (
+            f"- Single-run pass rate: **{summary['passed_runs']}/{summary['total_runs']} "
+            f"({summary['single_run_pass_rate']:.2%})**"
+        ),
+        (
+            "- Wilson 95% confidence interval: "
+            f"**[{summary['single_run_wilson_95']['lower']:.2%}, "
+            f"{summary['single_run_wilson_95']['upper']:.2%}]**"
+        ),
+        (
+            f"- Case-level stable pass rate: **{summary['stable_cases']}/"
+            f"{summary['total_cases']} ({summary['stable_case_rate']:.2%})**"
+        ),
+        "",
+        "| Case result | Cases |",
+        "|---|---:|",
+        f"| 3/3 PASS | {distribution['3/3']} |",
+        f"| 2/3 PASS | {distribution['2/3']} |",
+        f"| 1/3 PASS | {distribution['1/3']} |",
+        f"| 0/3 PASS | {distribution['0/3']} |",
+        "",
+        "## Category statistics",
+        "",
+        "| Category | Cases | Runs | Pass | Single-run Pass Rate |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for row in summary["categories"]:
+        lines.append(
+            f"| {_markdown_cell(row['category'])} | {row['cases']} | "
+            f"{row['runs']} | {row['passed']} | {row['pass_rate']:.2%} |"
+        )
+
+    stability = summary["stability"]
+    lines.extend(
+        [
+            "",
+            "## Stability summary",
+            "",
+            "| Metric | Cases |",
+            "|---|---:|",
+            f"| At least one failed run | {stability['cases_with_at_least_one_failure']} |",
+            f"| Failed exactly 1/3 | {stability['cases_failed_one_of_three']} |",
+            f"| Failed at least 2/3 | {stability['cases_failed_at_least_two_of_three']} |",
+            f"| Failed 3/3 | {stability['cases_failed_three_of_three']} |",
+            "",
+            "## Failure-stage aggregation",
+            "",
+            "| Failure Stage | Failed Runs | Affected Cases |",
+            "|---|---:|---:|",
+        ]
+    )
+    if summary["failure_stages"]:
+        for row in summary["failure_stages"]:
+            lines.append(
+                f"| {row['failure_stage']} | {row['failed_runs']} | "
+                f"{row['affected_cases']} |"
+            )
+    else:
+        lines.append("| — | 0 | 0 |")
+
+    failed_runs = [
+        (item, run_index, run)
+        for item in results
+        for run_index, run in enumerate(item.runs, start=1)
+        if not run.passed
+    ]
+    lines.extend(
+        [
+            "",
+            "## Failed runs",
+            "",
+            "| case_id | Run | Expected | Actual | Failure Stage | Reason |",
+            "|---|---:|---|---|---|---|",
+        ]
+    )
+    if failed_runs:
+        for item, run_index, run in failed_runs:
+            lines.append(
+                f"| `{item.case['id']}` | {run_index} | "
+                f"{item.case['expected_action']} | {run.actual_action} | "
+                f"{run.failure_stage or 'OTHER'} | "
+                f"{_markdown_cell('; '.join(run.reasons))} |"
+            )
+    else:
+        lines.append("| — | — | — | — | — | No failed runs |")
+
+    lines.extend(
+        [
+            "",
+            "## Failed-case summary",
+            "",
+            "| case_id | Failures / 3 | Stage | Summary |",
+            "|---|---:|---|---|",
+        ]
+    )
+    affected_items = [
+        item for item in results if any(not run.passed for run in item.runs)
+    ]
+    if affected_items:
+        for item in affected_items:
+            failed = [run for run in item.runs if not run.passed]
+            stages = ", ".join(
+                dict.fromkeys(run.failure_stage or "OTHER" for run in failed)
+            )
+            reasons = "; ".join(
+                dict.fromkeys(reason for run in failed for reason in run.reasons)
+            )
+            lines.append(
+                f"| `{item.case['id']}` | {len(failed)}/3 | {stages} | "
+                f"{_markdown_cell(reasons)} |"
+            )
+    else:
+        lines.append("| — | 0/3 | — | No affected cases |")
+
+    lines.extend(["", "## Token usage", ""])
+    if token_usage["status"] == "available":
+        lines.extend(
+            [
+                f"- Input tokens: **{token_usage['input_tokens']}**",
+                f"- Output tokens: **{token_usage['output_tokens']}**",
+                f"- Total tokens: **{token_usage['total_tokens']}**",
+            ]
+        )
+    else:
+        lines.append(f"- **unavailable** — {token_usage['reason']}")
+    lines.extend(
+        [
+            "",
+            f"Machine-readable results: `{FINAL_RESULTS_PATH.relative_to(PROJECT_ROOT).as_posix()}`",
+            "",
+        ]
+    )
+    FINAL_REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     cases = select_cases(load_cases())
     diagnostic_mode = bool(os.getenv("EVAL_CASE_IDS", "").strip())
+    final_report_mode = os.getenv("EVAL_FINAL_REPORT", "").strip() == "1"
+    if final_report_mode and (
+        len(cases) != 69 or RUNS_PER_CASE != 3 or diagnostic_mode
+    ):
+        raise ValueError("最终评测必须是完整 69 Case、每条 3 次且不筛选")
+    suite_started_at = datetime.now().astimezone()
+    suite_started = time.perf_counter()
+    git_commit = _git_text("rev-parse", "HEAD")
+    git_branch = _git_text("branch", "--show-current")
+    working_tree_dirty = bool(_git_text("status", "--porcelain"))
     port = free_port()
     fake_java = start_fake_java(port)
     original_base_url = os.environ.get("FAKE_JAVA_BASE_URL")
@@ -625,13 +1178,20 @@ def main() -> None:
                 )
                 started_at = time.perf_counter()
                 try:
-                    result, tokens, latency = invoke_case(
+                    result, token_usage, latency = invoke_case(
                         agent,
                         AgentContext,
                         case,
                         session_id=f"eval-{case['id']}-{uuid.uuid4().hex}",
                     )
-                    runs.append(evaluate_result(result, case, tokens, latency))
+                    runs.append(
+                        evaluate_result(
+                            result,
+                            case,
+                            token_usage,
+                            latency,
+                        )
+                    )
                 except Exception as error:
                     runs.append(
                         EvalRun(
@@ -644,9 +1204,15 @@ def main() -> None:
                             rule_matches=[],
                             rule_claims=[],
                             final_answer="",
+                            input_tokens=None,
+                            output_tokens=None,
                             token_count=0,
                             latency_seconds=time.perf_counter() - started_at,
                             reasons=[f"运行异常: {type(error).__name__}"],
+                            failure_stage="OTHER",
+                            parsed_entities=[],
+                            requirement_status=None,
+                            tool_results=[],
                         )
                     )
             results.append(CaseRuns(case=case, runs=runs))
@@ -683,6 +1249,26 @@ def main() -> None:
         print()
         print_case_results(results)
         print_metrics(results)
+        if final_report_mode:
+            suite_completed_at = datetime.now().astimezone()
+            metadata = {
+                "git_commit": git_commit,
+                "git_branch": git_branch,
+                "working_tree_dirty": working_tree_dirty,
+                "model": os.getenv("OPENAI_MODEL", "unavailable"),
+                "started_at": suite_started_at.isoformat(timespec="seconds"),
+                "completed_at": suite_completed_at.isoformat(
+                    timespec="seconds"
+                ),
+                "elapsed_seconds": time.perf_counter() - suite_started,
+                "runs_per_case": RUNS_PER_CASE,
+                "total_cases": len(cases),
+                "total_runs": len(cases) * RUNS_PER_CASE,
+                "execution": "sequential; independent session/thread per run",
+            }
+            _write_final_artifacts(results, metadata)
+            print(f"FINAL_RESULTS {FINAL_RESULTS_PATH}")
+            print(f"FINAL_REPORT {FINAL_REPORT_PATH}")
     finally:
         if agent is not None:
             close_order_agent(agent)

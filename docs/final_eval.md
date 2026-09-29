@@ -4,7 +4,10 @@
 
 - Git commit: `4ba07180e0216b67892ccae27b32497a46d0509e`
 - Branch: `main`
-- Model: `deepseek-chat`
+- Configured model: `deepseek-chat`
+- API-reported model: `deepseek-flash`
+- Provider endpoint: `api.deepseek.com`
+- Model identity verification: a separate minimal request used the same `OPENAI_BASE_URL`, `OPENAI_MODEL`, API key, and `ChatOpenAI` client configuration as E1. The API response `model` field reported `deepseek-flash`; this is recorded separately from the configured model and does not change any E1 metrics.
 - Started: `2026-09-28T23:07:14+08:00`
 - Completed: `2026-09-28T23:19:55+08:00`
 - Total elapsed: `761.193s`

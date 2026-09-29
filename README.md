@@ -247,48 +247,4 @@ Demo 固定使用单个 Uvicorn worker。当前 session lock 是进程内
 分布式 session lock，并将 reconciler 改为 leader 或独立 worker，避免多实例
 并发推进同一状态。
 
-### 极简面试页面
 
-Compose 默认设置 `DEMO_ENABLED=true`。服务 ready 且域名证书生效后打开
-`https://<DEMO_DOMAIN>/`，点击“开始体验”即可。页面调用
-`POST /demo/session` 获取 30 分钟有效的固定 `demo_user` 访问令牌与四个演示订单；
-浏览器不能提交或选择 `user_id`。JWT 和退款确认 credential 只保存在页面内存，
-不会写入 URL、Web Storage、控制台或普通聊天消息。页面只把非敏感
-`lease_token` 写入 `sessionStorage`；刷新后用它恢复同一 lease 并重新签发短期
-Demo JWT。`lease_token` 不能作为 Bearer token 调用 Agent 或 Java API。
-
-这是单访客面试环境：进程内 lease 同一时间只允许一个有效体验会话，其他访客
-会收到 `429`“演示环境正在使用，请稍后再试。”。lease 具有 30 分钟绝对有效期和
-5 分钟空闲期限；过期或点击“结束体验”时，服务端会先确认没有处于
-`CONFIRMED/EXECUTING/UNKNOWN` 的退款，再调用 Java Demo reset，最后只清理固定
-`demo_user` 的 action、session ownership 和 LangGraph checkpoint。任一步失败都不会
-释放 lease 或接纳下一位访客。
-
-聊天限流键由已验证 JWT 中的 `demo_lease_id` 与可信客户端 IP 组成，客户端提交的
-`session_id` 不能绕过每分钟 20 条限制。默认忽略 `X-Forwarded-For`；仅当
-`DEMO_TRUST_PROXY_HEADERS=true` 且直连来源位于 `DEMO_TRUSTED_PROXY_IPS` 时才采用
-首个转发 IP。`/demo/session` 另有持久化的每 IP 每小时 10 次限制。
-
-Demo 每日模型 token 上限默认 500,000，按 UTC 日期在 `/app/data/demo_state.sqlite`
-持久化累计 input/output/total token。计量直接复用 E1 所使用的模型响应
-`usage_metadata` / `llm_output.token_usage`，不估算本地 Java、Embedding 或 Reranker。
-达到上限后下一条聊天不会调用 LLM，并提示“今日演示额度已用完，请明天再试。”。
-Java reset 和本地 Demo 数据清理不会清除 IP 计数或 token 配额。
-
-相关配置为 `DEMO_LEASE_TTL_SECONDS=1800`、`DEMO_IDLE_TIMEOUT_SECONDS=300`、
-`DEMO_DAILY_TOKEN_LIMIT=500000`、`DEMO_TRUST_PROXY_HEADERS=true` 和
-`DEMO_TRUSTED_PROXY_IPS=172.30.0.250`。单条消息最多 500 字。
-`DEMO_ENABLED` 未开启时，页面、`/demo/session` 与 `/demo/release` 均不注册并返回
-`404`。
-
-公开 Demo 是单访客演示环境，不是多租户生产服务。面试前如需恢复 Java 订单、
-SQLite checkpoint 和 action ledger 的初始状态，由部署人员执行：
-
-```bash
-docker compose --env-file deploy/.env.demo -f deploy/compose.yml down -v
-docker compose --env-file deploy/.env.demo -f deploy/compose.yml up -d --build
-```
-
-页面不会向浏览器暴露独立 Reset API；“结束体验”只调用受当前 Demo JWT 和 lease
-约束的 `/demo/release`，由服务端执行上述安全恢复流程。该公开 Demo 仍是单进程、
-单访客面试环境，不是多租户生产服务。
